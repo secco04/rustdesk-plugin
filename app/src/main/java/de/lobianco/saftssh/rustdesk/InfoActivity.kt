@@ -414,7 +414,7 @@ class InfoActivity : Activity() {
                     textSize = 12f
                     setOnClickListener {
                         val id = sessionId ?: return@setOnClickListener
-                        NativeBridge.inputKey(id, vkName, true, true)
+                        NativeBridge.inputKey(id, vkName, true, true, false, false)
                     }
                 },
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
