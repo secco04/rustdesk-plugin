@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Needed to keep a session alive while both apps are backgrounded — same reasoning as the
+         Linux Plugin's LinuxSessionService.startForeground / Remote Desktop Plugin's equivalent. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Without this, getPackageManager().getLaunchIntentForPackage() for LobiShell returns null
+         on Android 11+ (API 30+) package-visibility filtering, even when it's installed. -->
+    <queries>
+        <package android:name="de.lobianco.saftssh" />
+    </queries>
+
+    <application
+        android:label="LobiShell RustDesk Plugin"
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        android:icon="@mipmap/ic_launcher">
+
+        <!--
+            Minimal launcher activity so the APK is launchable and Play Store-acceptable.
+            Users who open this from the launcher see an informational screen; there is nothing
+            to configure here — the plugin works entirely as a bound service.
+        -->
+        <activity
+            android:name=".InfoActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            The RustDesk session service. exported="true" is required for cross-app binding, but no
+            custom Android permission gates it (see the other plugins' onBind() doc for why — a
+            "dangerous" custom permission's grant dialog renders as a generic, alarming "perform an
+            unknown action" on modern Android) — it checks the caller's package identity directly.
+        -->
+        <service
+            android:name=".RustDeskSessionService"
+            android:exported="true"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps a user-started RustDesk remote desktop session alive while backgrounded" />
+            <intent-filter>
+                <action android:name="de.lobianco.saftssh.rustdesk.BIND_SESSION_SERVICE" />
+            </intent-filter>
+        </service>
+
+    </application>
+
+</manifest>

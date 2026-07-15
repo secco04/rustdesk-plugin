@@ -1,0 +1,22 @@
+[package]
+name = "android-shim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# M1 (see plans/soft-frolicking-thimble.md): prove the vendored RustDesk core cross-compiles for
+# Android as a bare library dependency, outside RustDesk's own build.py/vcpkg orchestration. One
+# trivial exported function only — no real bridging logic yet.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Package name is "rustdesk" (see ../rustdesk-upstream/Cargo.toml [package]); its [lib] name is
+# "librustdesk", so it's imported as `librustdesk::...`, not `rustdesk::...`.
+rustdesk = { path = "../rustdesk-upstream", default-features = false, features = ["flutter", "use_dasp"] }
+jni = "0.21"
+uuid = "1"
+# M4 (plans/soft-frolicking-thimble.md): builds session_send_mouse's JSON message string. Already
+# pinned in rustdesk-upstream's Cargo.lock (which we copy in before every build), so this adds no
+# new dependency version to resolve.
+serde_json = "1"

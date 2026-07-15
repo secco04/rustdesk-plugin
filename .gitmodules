@@ -1,0 +1,7 @@
+[submodule "rust/rustdesk-upstream"]
+	path = rust/rustdesk-upstream
+	# Fork of rustdesk/rustdesk (not upstream directly) — pinned commit below is on branch
+	# lobishell-android-1.4.9, which carries the small additive patches enabling a headless
+	# (non-Flutter) Android client build. See that branch's commit message for the full list.
+	url = https://github.com/secco04/rustdesk.git
+	branch = lobishell-android-1.4.9
