@@ -181,11 +181,18 @@ class RustDeskSessionService : Service() {
         // until the first real position arrives).
         @Volatile private var pointerFbX = -1
         @Volatile private var pointerFbY = -1
-        // Throttles the cursor-move-triggered redraw to ~60fps — same reasoning as VncClient's
-        // lastCursorBlitMs: touch delivers move events much faster than that, and every blitToSurface
-        // call takes the same Surface lock the video-pump thread uses for real frames, so redrawing
-        // on every single move event could starve real frame updates and read as "laggy video".
-        @Volatile private var lastCursorBlitMs = 0L
+        // Throttles cursor-move AND zoom/pan-change redraws to a shared ~60fps budget — same
+        // reasoning as VncClient's lastCursorBlitMs: touch delivers move events much faster than
+        // that, and every blitToSurface call takes the same Surface lock the video-pump thread
+        // uses for real frames, so redrawing on every single move event could starve real frame
+        // updates. Originally only sendMouse used this; setZoom redrew UNTHROTTLED on every call,
+        // which is exactly what edge-panning (RustDeskScreen's handleMove) triggers on every touch
+        // move sample while zoomed — sendMouse's throttled redraw AND setZoom's unthrottled one
+        // firing back-to-back on every move event was the reported "cursor lags, especially when
+        // panning at the edge": far more than 60 blits/sec, contending with the video-pump
+        // thread's own redraws for the same Surface lock. Sharing one timestamp between both call
+        // sites caps their COMBINED rate instead of each getting its own independent 60fps budget.
+        @Volatile private var lastExtraBlitMs = 0L
         // Same fix as VncClient's identical problem (task #43): turning the DISPLAY off (not
         // backgrounding the app) does NOT invalidate/reallocate the SurfaceView's Surface — so
         // `surface.isValid` stays true and lockCanvas() itself is what starts failing natively
@@ -203,6 +210,11 @@ class RustDeskSessionService : Service() {
         // the new display can have a different resolution, and RustDeskViewModel needs the new
         // width/height for its own touch inverse-map.
         @Volatile private var currentDisplay = 0
+        // blitToSurface() is called from three different threads (the video-pump thread, plus
+        // Binder threadpool threads for sendMouse's/setZoom's own redraw) — Surface.lockCanvas()
+        // isn't designed for concurrent calls from multiple threads at once, and letting them race
+        // was plausibly adding to the reported cursor lag on top of the throttling fix above.
+        private val renderLock = Any()
         private val videoThread = Thread({ pumpVideo() }, "RustDesk-video-$sessionId").apply {
             isDaemon = true
             start()
@@ -269,36 +281,41 @@ class RustDeskSessionService : Service() {
             if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
             lastBlitAttemptMs = now
             try {
-                val canvas: Canvas = s.lockCanvas(null) ?: run {
-                    Log.w(TAG, "blitToSurface($sessionId): lockCanvas() returned null")
-                    blitFailing = true
-                    return
-                }
-                try {
-                    val sw = canvas.width.toFloat()
-                    val sh = canvas.height.toFloat()
-                    // Base letterbox fit * pinch-zoom on top (see setZoom / VncClient.blitToSurface).
-                    // RustDeskScreen owns zoomScale/panX/panY and applies the SAME transform in its
-                    // touch inverse-map, so taps land correctly while zoomed.
-                    val scale = minOf(sw / bitmap.width, sh / bitmap.height) * zoomScale
-                    val dw = bitmap.width * scale
-                    val dh = bitmap.height * scale
-                    // Horizontally centred, top-aligned vertically (not centred) — user
-                    // preference; must match RustDeskScreen's sendAt inverse-map exactly, or
-                    // touches land at the wrong remote position.
-                    val ox = (sw - dw) / 2f + panX
-                    val oy = panY
-                    canvas.drawColor(Color.BLACK)
-                    canvas.drawBitmap(bitmap, null, RectF(ox, oy, ox + dw, oy + dh), null)
-                    if (pointerFbX >= 0 && pointerFbY >= 0) {
-                        SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                // Serializes against the OTHER threads that can call this concurrently (video-pump
+                // thread vs. Binder threadpool threads via sendMouse/setZoom) — Surface.lockCanvas()
+                // isn't meant to be raced from multiple threads at once; see renderLock's doc.
+                synchronized(renderLock) {
+                    val canvas: Canvas = s.lockCanvas(null) ?: run {
+                        Log.w(TAG, "blitToSurface($sessionId): lockCanvas() returned null")
+                        blitFailing = true
+                        return
                     }
-                    if (!loggedFirstBlit) {
-                        loggedFirstBlit = true
-                        Log.i(TAG, "blitToSurface($sessionId): first frame drawn, canvas=${sw}x$sh bitmap=${bitmap.width}x${bitmap.height}")
+                    try {
+                        val sw = canvas.width.toFloat()
+                        val sh = canvas.height.toFloat()
+                        // Base letterbox fit * pinch-zoom on top (see setZoom / VncClient.blitToSurface).
+                        // RustDeskScreen owns zoomScale/panX/panY and applies the SAME transform in its
+                        // touch inverse-map, so taps land correctly while zoomed.
+                        val scale = minOf(sw / bitmap.width, sh / bitmap.height) * zoomScale
+                        val dw = bitmap.width * scale
+                        val dh = bitmap.height * scale
+                        // Horizontally centred, top-aligned vertically (not centred) — user
+                        // preference; must match RustDeskScreen's sendAt inverse-map exactly, or
+                        // touches land at the wrong remote position.
+                        val ox = (sw - dw) / 2f + panX
+                        val oy = panY
+                        canvas.drawColor(Color.BLACK)
+                        canvas.drawBitmap(bitmap, null, RectF(ox, oy, ox + dw, oy + dh), null)
+                        if (pointerFbX >= 0 && pointerFbY >= 0) {
+                            SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                        }
+                        if (!loggedFirstBlit) {
+                            loggedFirstBlit = true
+                            Log.i(TAG, "blitToSurface($sessionId): first frame drawn, canvas=${sw}x$sh bitmap=${bitmap.width}x${bitmap.height}")
+                        }
+                    } finally {
+                        s.unlockCanvasAndPost(canvas)
                     }
-                } finally {
-                    s.unlockCanvasAndPost(canvas)
                 }
                 blitFailing = false
             } catch (e: Exception) {
@@ -331,8 +348,8 @@ class RustDeskSessionService : Service() {
                 pointerFbX = x
                 pointerFbY = y
                 val now = System.currentTimeMillis()
-                if (now - lastCursorBlitMs >= 16L) {
-                    lastCursorBlitMs = now
+                if (now - lastExtraBlitMs >= 16L) {
+                    lastExtraBlitMs = now
                     currentBitmap?.let { blitToSurface(it) }
                 }
             }
@@ -344,8 +361,14 @@ class RustDeskSessionService : Service() {
             zoomScale = scale.coerceAtLeast(0.1f)
             panX = panXValue
             panY = panYValue
-            // Redraw immediately so a pinch reflects even without a fresh server frame.
-            currentBitmap?.let { blitToSurface(it) }
+            // Throttled the same as sendMouse's cursor-redraw (shared lastExtraBlitMs) — this used
+            // to redraw unconditionally on every call, which is what made edge-panning (called on
+            // every touch-move sample while zoomed) visibly lag: see lastExtraBlitMs's doc.
+            val now = System.currentTimeMillis()
+            if (now - lastExtraBlitMs >= 16L) {
+                lastExtraBlitMs = now
+                currentBitmap?.let { blitToSurface(it) }
+            }
         }
 
         override fun inputKey(name: String?, down: Boolean, press: Boolean) {
