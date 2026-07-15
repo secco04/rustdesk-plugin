@@ -186,6 +186,27 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connect<'l
     })
 }
 
+/// Pre-connect online check — queries the rendezvous server directly for whether `id` is
+/// currently reachable, without opening a session. Call `setServerConfig` first if using a custom
+/// server (same as before `connect`). Blocks the calling thread for up to ~3s — call off the UI
+/// thread. Returns 1 (online), 0 (offline), or -1 (unknown — the query itself failed, e.g. no
+/// network; callers should treat this as "proceed with the normal connect attempt anyway", not as
+/// a definite offline).
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_checkOnline<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    id: JString<'local>,
+) -> jint {
+    guard(-1, move || {
+        let id: String = env.get_string(&id).map(|s| s.into()).unwrap_or_default();
+        if id.is_empty() {
+            return -1;
+        }
+        librustdesk::flutter::session_is_id_online(id)
+    })
+}
+
 /// Rough connectivity proxy for M2: true once the session has produced at least one video frame.
 /// There is no push-based "connected" event available without a real Dart isolate (see
 /// session_start_headless's doc comment) — a proper sync connection-state getter is still an open

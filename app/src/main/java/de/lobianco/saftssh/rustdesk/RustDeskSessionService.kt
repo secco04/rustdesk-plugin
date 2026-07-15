@@ -138,6 +138,18 @@ class RustDeskSessionService : Service() {
             promoteToForeground()
             return session
         }
+
+        override fun checkOnline(
+            id: String,
+            idServer: String,
+            relayServer: String,
+            apiServer: String,
+            key: String,
+        ): Int {
+            if (!isCallerAuthorized()) return -1
+            NativeBridge.setServerConfig(idServer, relayServer, apiServer, key)
+            return NativeBridge.checkOnline(id)
+        }
     }
 
     private inner class RustDeskSessionImpl(

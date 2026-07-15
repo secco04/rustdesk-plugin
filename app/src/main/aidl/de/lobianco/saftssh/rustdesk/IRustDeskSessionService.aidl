@@ -28,4 +28,21 @@ interface IRustDeskSessionService {
         in Surface surface,
         in IRustDeskSessionCallback callback
     );
+
+    /**
+     * Pre-connect online check — queries the rendezvous server directly for whether [id] is
+     * currently reachable, without opening a session. [idServer]/[relayServer]/[apiServer]/[key]
+     * blank = RustDesk's public default servers (same as createSession's params). Blocks the
+     * calling thread for up to ~3s (the native query's own internal timeout) — callers must not
+     * call this from the main thread. Returns 1 (online), 0 (offline), or -1 (unknown — the query
+     * itself failed, e.g. no network reachable; treat this as "proceed with createSession anyway",
+     * not as a definite offline).
+     */
+    int checkOnline(
+        String id,
+        String idServer,
+        String relayServer,
+        String apiServer,
+        String key
+    );
 }

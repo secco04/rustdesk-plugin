@@ -35,6 +35,12 @@ object NativeBridge {
     /** Returns a session id (UUID string) on success, or "ERR:<message>" on failure. */
     external fun connect(id: String, password: String): String
 
+    /** Pre-connect online check — queries the rendezvous server directly for whether [id] is
+     *  currently reachable, no session needed. Call [setServerConfig] first if using a custom
+     *  server. Blocks the calling thread for up to ~3s — never call from the main thread. Returns
+     *  1 (online), 0 (offline), or -1 (unknown — treat as "try connecting anyway", not offline). */
+    external fun checkOnline(id: String): Int
+
     /** Rough connectivity proxy — true once the session has produced at least one video frame.
      *  See IRustDeskSession.aidl's doc for why this isn't yet a proper connect/fail signal. */
     external fun isAlive(sessionId: String): Boolean
