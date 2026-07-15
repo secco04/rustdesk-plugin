@@ -24,6 +24,10 @@ private const val NOTIF_ID = 3001
 // blitToSurface() rate-limit when the Surface can't be locked (e.g. display off) — see that
 // function's doc for why this can't be detected proactively.
 private const val BLIT_RETRY_INTERVAL_MS = 2000L
+// Consecutive failures required before the above backoff engages — see consecutiveBlitFailures'
+// doc: a single resize-triggered miss self-heals on the very next frame and shouldn't cost a
+// multi-second stall; only a sustained run of failures should.
+private const val BLIT_FAILURE_ESCALATION_THRESHOLD = 3
 
 /** IMPORTANT: this check must live in the AIDL Stub's method bodies, NOT in Service.onBind() —
  *  onBind() is a local lifecycle callback dispatched by this process's own ActivityThread, not a
@@ -204,6 +208,17 @@ class RustDeskSessionService : Service() {
         // resets automatically once a real attempt succeeds again (screen back on).
         @Volatile private var blitFailing = false
         @Volatile private var lastBlitAttemptMs = 0L
+        // Counts CONSECUTIVE failures before escalating to the long backoff above — added after a
+        // reported lag every time the video area is resized (IME show/hide, key-bar toggle
+        // — see RustDeskScreen's bottomBarHeight/keyBarHeight padding). A resize makes the
+        // SurfaceView's underlying BufferQueue briefly reject a buffer sized for the surface's
+        // PREVIOUS dimensions (confirmed via on-device logcat: "rejecting buffer" native errors
+        // correlating exactly with IME/key-bar toggles) — a purely transient, self-healing hiccup
+        // that used to immediately trip the SAME BLIT_RETRY_INTERVAL_MS (2s) backoff meant for the
+        // display-off scenario, causing a multi-second visible freeze on every single toggle.
+        // Escalating only after several consecutive failures keeps the real display-off protection
+        // (task #43) while no longer punishing a one-off resize-induced miss.
+        @Volatile private var consecutiveBlitFailures = 0
         // Multi-monitor: which display index pumpVideo currently polls/renders. switchDisplay()
         // bumps this AND clears currentBitmap + announcedConnected so pumpVideo re-runs its
         // "discover size, then announce onConnected" sequence exactly like a fresh connect —
@@ -287,7 +302,7 @@ class RustDeskSessionService : Service() {
                 synchronized(renderLock) {
                     val canvas: Canvas = s.lockCanvas(null) ?: run {
                         Log.w(TAG, "blitToSurface($sessionId): lockCanvas() returned null")
-                        blitFailing = true
+                        registerBlitFailure()
                         return
                     }
                     try {
@@ -317,18 +332,28 @@ class RustDeskSessionService : Service() {
                         s.unlockCanvasAndPost(canvas)
                     }
                 }
+                consecutiveBlitFailures = 0
                 blitFailing = false
             } catch (e: Exception) {
                 // Surface torn down mid-blit (e.g. caller backgrounded) is expected and self-heals
                 // on the next frame — but log it (rate-limited) so a PERSISTENT failure (e.g. the
                 // parceled cross-process Surface never actually becoming usable) is visible instead
                 // of silently showing a black view forever with no trace in logcat.
-                blitFailing = true
+                registerBlitFailure()
                 blitFailLogCount++
                 if (blitFailLogCount <= 5 || blitFailLogCount % 50 == 0) {
                     Log.w(TAG, "blitToSurface($sessionId) failed (#$blitFailLogCount): ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
+        }
+
+        /** Registers one blit failure — only escalates to the long [BLIT_RETRY_INTERVAL_MS] backoff
+         *  once [BLIT_FAILURE_ESCALATION_THRESHOLD] failures happen in a row (see
+         *  consecutiveBlitFailures' doc for why: a single resize-triggered miss self-heals on its
+         *  own next frame and shouldn't cost a multi-second stall). */
+        private fun registerBlitFailure() {
+            consecutiveBlitFailures++
+            blitFailing = consecutiveBlitFailures >= BLIT_FAILURE_ESCALATION_THRESHOLD
         }
 
         override fun updateSurface(newSurface: Surface?) {
@@ -338,6 +363,7 @@ class RustDeskSessionService : Service() {
             // over from the old one failing (e.g. display was off, screen just came back on with
             // a fresh Surface after the app resumed) — same reasoning as VncClient's identical fix.
             blitFailing = false
+            consecutiveBlitFailures = 0
         }
 
         override fun sendMouse(x: Int, y: Int, mouseType: String?, buttons: String?) {
