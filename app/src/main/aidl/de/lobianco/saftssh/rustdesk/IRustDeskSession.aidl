@@ -53,6 +53,11 @@ interface IRustDeskSession {
      *  getFrame-equivalent polling path the plugin already drives internally. */
     oneway void switchDisplay(int display);
 
+    /** Quality/speed — [value] is "best", "balanced", or "low" (RustDesk's own image-quality
+     *  values; anything else is silently ignored on the Rust side). Live — sends a message to the
+     *  already-connected peer, no reconnect needed. */
+    oneway void setQuality(String value);
+
     /** Tears down the connection. oneway: native teardown can block for an unbounded time (same
      *  reasoning as IRemoteDesktopSession.destroy() in the VNC/RDP/Proxmox VE plugin). */
     oneway void destroy();

@@ -41,6 +41,10 @@ object NativeBridge {
      *  1 (online), 0 (offline), or -1 (unknown — treat as "try connecting anyway", not offline). */
     external fun checkOnline(id: String): Int
 
+    /** Quality/speed — [value] is "best", "balanced", or "low" (RustDesk's own image-quality
+     *  values). Live — sends a message to the already-connected peer, no reconnect needed. */
+    external fun setImageQuality(sessionId: String, value: String)
+
     /** Rough connectivity proxy — true once the session has produced at least one video frame.
      *  See IRustDeskSession.aidl's doc for why this isn't yet a proper connect/fail signal. */
     external fun isAlive(sessionId: String): Boolean

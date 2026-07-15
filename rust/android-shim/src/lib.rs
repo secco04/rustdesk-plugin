@@ -233,6 +233,30 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_isAlive<'l
     })
 }
 
+/// Quality/speed control — `value` is one of "best", "balanced", or "low" (RustDesk's own
+/// `client.rs::get_image_quality_enum` values; anything else is silently ignored on the Rust
+/// side). Wraps `flutter_ffi::session_set_image_quality`, which sends a live message to the
+/// already-connected peer — no reconnect needed, same as `codec-preference` in `connect()`.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_setImageQuality<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    value: JString<'local>,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        let value: String = env.get_string(&value).map(|s| s.into()).unwrap_or_default();
+        librustdesk::flutter_ffi::session_set_image_quality(session_id, value);
+    })
+}
+
 /// M3 (plans/soft-frolicking-thimble.md): [width, height] for `display`, or null if unknown yet
 /// (e.g. before the peer handshake completes — poll again shortly).
 #[no_mangle]

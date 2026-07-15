@@ -429,6 +429,11 @@ class RustDeskSessionService : Service() {
             NativeBridge.switchDisplay(sessionId, display)
         }
 
+        override fun setQuality(value: String?) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.setImageQuality(sessionId, value.orEmpty())
+        }
+
         override fun destroy() {
             if (!isCallerAuthorized()) return
             destroyInternal()
