@@ -1,5 +1,9 @@
 package de.lobianco.saftssh.rustdesk
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.graphics.Bitmap
@@ -7,12 +11,16 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.RectF
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
+import java.util.concurrent.CopyOnWriteArrayList
 
 private const val TAG = "RustDeskSessionService"
+private const val NOTIF_CHANNEL_ID = "rustdesk_session"
+private const val NOTIF_ID = 3001
 // blitToSurface() rate-limit when the Surface can't be locked (e.g. display off) — see that
 // function's doc for why this can't be detected proactively.
 private const val BLIT_RETRY_INTERVAL_MS = 2000L
@@ -31,12 +39,67 @@ private val ALLOWED_CALLER_PACKAGES = setOf("de.lobianco.saftssh")
  */
 class RustDeskSessionService : Service() {
 
+    // A plain bound service has no priority protection: once BOTH the main app and this plugin are
+    // backgrounded (or the screen turns off, which backgrounds the main app's Activity the same
+    // way), the OS kills this process under memory pressure — confirmed as the cause of a reported
+    // "connection drops when backgrounded/screen off", since nothing kept the process's priority up
+    // while the native client socket/video-pump thread it owns needed to keep running. Same pattern
+    // as RemoteDesktopSessionService/LinuxSessionService's promoteToForeground — the manifest's
+    // foregroundServiceType="specialUse" + FOREGROUND_SERVICE(_SPECIAL_USE) permissions were already
+    // in place for this, just never wired up on the Kotlin side.
+    private val openSessions = CopyOnWriteArrayList<RustDeskSessionImpl>()
+
     override fun onCreate() {
         super.onCreate()
         NativeBridge.initialize(filesDir.absolutePath)
     }
 
     override fun onBind(intent: Intent?): IBinder = serviceStub
+
+    override fun onDestroy() {
+        openSessions.forEach { runCatching { it.destroyInternal() } }
+        openSessions.clear()
+        super.onDestroy()
+    }
+
+    private fun ensureNotifChannel() {
+        val nm = getSystemService(NotificationManager::class.java)
+        if (nm.getNotificationChannel(NOTIF_CHANNEL_ID) == null) {
+            nm.createNotificationChannel(
+                NotificationChannel(NOTIF_CHANNEL_ID, "RustDesk session", NotificationManager.IMPORTANCE_MIN)
+                    .apply { description = "Keeps the RustDesk session running in the background" }
+            )
+        }
+    }
+
+    private fun promoteToForeground() {
+        ensureNotifChannel()
+        val notification = Notification.Builder(this, NOTIF_CHANNEL_ID)
+            .setContentTitle("RustDesk session running")
+            .setContentText("Tap to return to LobiShell")
+            .setSmallIcon(android.R.drawable.ic_menu_agenda)
+            .setOngoing(true)
+            .apply {
+                packageManager.getLaunchIntentForPackage("de.lobianco.saftssh")?.let { launch ->
+                    setContentIntent(
+                        PendingIntent.getActivity(
+                            this@RustDeskSessionService, 0, launch,
+                            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                        )
+                    )
+                }
+            }
+            .build()
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIF_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIF_ID, notification)
+        }
+    }
+
+    private fun demoteFromForegroundIfIdle() {
+        if (openSessions.isEmpty()) stopForeground(STOP_FOREGROUND_REMOVE)
+    }
 
     /** True if the app on the other end of the CURRENT incoming Binder transaction is an
      *  authorized caller. Must only be called from inside an AIDL Stub method body. */
@@ -70,7 +133,10 @@ class RustDeskSessionService : Service() {
                 runCatching { callback?.onDisconnected(reason) }
                 return null
             }
-            return RustDeskSessionImpl(result, surface, callback)
+            val session = RustDeskSessionImpl(result, surface, callback)
+            openSessions.add(session)
+            promoteToForeground()
+            return session
         }
     }
 
@@ -304,10 +370,22 @@ class RustDeskSessionService : Service() {
 
         override fun destroy() {
             if (!isCallerAuthorized()) return
+            destroyInternal()
+        }
+
+        /** The real teardown — no [isCallerAuthorized] check, since [Service.onDestroy] (which
+         *  calls this on every still-open session) is a local lifecycle callback, not a live
+         *  incoming Binder transaction; [Binder.getCallingUid] there resolves to this process's
+         *  OWN uid, which isn't in [ALLOWED_CALLER_PACKAGES] — calling the AIDL-gated [destroy]
+         *  from there would silently no-op and leak the native session/thread. Same split as
+         *  RemoteDesktopSessionService's destroy()/destroyInternal(). */
+        fun destroyInternal() {
             running = false
             videoThread.interrupt()
             surface = null
             NativeBridge.disconnect(sessionId)
+            openSessions.remove(this)
+            demoteFromForegroundIfIdle()
         }
     }
 }
