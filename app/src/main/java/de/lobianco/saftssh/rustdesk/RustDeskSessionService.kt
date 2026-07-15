@@ -119,6 +119,12 @@ class RustDeskSessionService : Service() {
         // resets automatically once a real attempt succeeds again (screen back on).
         @Volatile private var blitFailing = false
         @Volatile private var lastBlitAttemptMs = 0L
+        // Multi-monitor: which display index pumpVideo currently polls/renders. switchDisplay()
+        // bumps this AND clears currentBitmap + announcedConnected so pumpVideo re-runs its
+        // "discover size, then announce onConnected" sequence exactly like a fresh connect —
+        // the new display can have a different resolution, and RustDeskViewModel needs the new
+        // width/height for its own touch inverse-map.
+        @Volatile private var currentDisplay = 0
         private val videoThread = Thread({ pumpVideo() }, "RustDesk-video-$sessionId").apply {
             isDaemon = true
             start()
@@ -134,8 +140,12 @@ class RustDeskSessionService : Service() {
         private fun pumpVideo() {
             try {
                 while (running) {
+                    // Captured once per iteration (not re-read below) so a switchDisplay() call
+                    // mid-iteration can't mismatch the size this bitmap was allocated for against
+                    // the display getFrame reads from.
+                    val display = currentDisplay
                     val bmp = currentBitmap ?: run {
-                        val size = NativeBridge.getDisplaySize(sessionId, 0)
+                        val size = NativeBridge.getDisplaySize(sessionId, display)
                         if (size == null || size.size != 2 || size[0] <= 0 || size[1] <= 0) {
                             Thread.sleep(200)
                             return@run null
@@ -148,7 +158,7 @@ class RustDeskSessionService : Service() {
                         }
                         fresh
                     } ?: continue
-                    val frame = NativeBridge.getFrame(sessionId, 0)
+                    val frame = NativeBridge.getFrame(sessionId, display)
                     if (frame == null) {
                         Thread.sleep(16)
                         continue
@@ -273,6 +283,23 @@ class RustDeskSessionService : Service() {
         override fun isAlive(): Boolean {
             if (!isCallerAuthorized()) return false
             return NativeBridge.isAlive(sessionId)
+        }
+
+        override fun getDisplayCount(): Int {
+            if (!isCallerAuthorized()) return 0
+            return NativeBridge.getDisplayCount(sessionId)
+        }
+
+        override fun switchDisplay(display: Int) {
+            if (!isCallerAuthorized()) return
+            currentDisplay = display
+            // Force pumpVideo's "size unknown yet" branch to run again for the new display, and
+            // let onConnected fire a second time with the new size — RustDeskViewModel needs the
+            // fresh width/height for its own touch inverse-map, same as a real fresh connect.
+            currentBitmap = null
+            announcedConnected = false
+            loggedFirstBlit = false
+            NativeBridge.switchDisplay(sessionId, display)
         }
 
         override fun destroy() {

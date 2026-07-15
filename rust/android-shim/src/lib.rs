@@ -394,6 +394,52 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_inputStrin
     })
 }
 
+/// Multi-monitor (lobishell-android): number of displays the peer reported, or 0 if not known yet
+/// (poll again shortly after connect — same "before the peer handshake completes" caveat as
+/// getDisplaySize).
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_getDisplayCount<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jint {
+    guard(0, move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return 0;
+        };
+        librustdesk::flutter::session_get_display_count(session_id)
+    })
+}
+
+/// Multi-monitor (lobishell-android): switches which single display this session captures/views.
+/// `is_desktop = false` in the underlying call (matches RustDesk's own mobile/viewer-style client,
+/// not its multi-window desktop client) — appropriate here since we only ever render one display
+/// at a time, never several side by side. Fire-and-forget: the peer's reply (new size, first frame
+/// of the new display) arrives through the same getDisplaySize/getFrame polling path as a fresh
+/// connect: getDisplaySize returns 0x0 again until the peer_info catches up.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_switchDisplay<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    display: jint,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        librustdesk::flutter_ffi::session_switch_display(false, session_id, vec![display]);
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_disconnect<'local>(
     mut env: JNIEnv<'local>,

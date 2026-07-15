@@ -39,6 +39,16 @@ interface IRustDeskSession {
      *  polling fallback, same as IRemoteDesktopSession.isAlive(). */
     boolean isAlive();
 
+    /** Number of displays (monitors) the peer reported, or 0 if not known yet (poll again shortly
+     *  after connect). Quick synchronous native field read, same cost class as isAlive(). */
+    int getDisplayCount();
+
+    /** Switches which single display (0-based index) this session captures/views — we only ever
+     *  render one display at a time, never several side by side. oneway: fire-and-forget, same as
+     *  setZoom; the new display's size/first frame arrive through the normal getDisplaySize/
+     *  getFrame-equivalent polling path the plugin already drives internally. */
+    oneway void switchDisplay(int display);
+
     /** Tears down the connection. oneway: native teardown can block for an unbounded time (same
      *  reasoning as IRemoteDesktopSession.destroy() in the VNC/RDP/Proxmox VE plugin). */
     oneway void destroy();

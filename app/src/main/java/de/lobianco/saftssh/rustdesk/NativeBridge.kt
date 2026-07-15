@@ -65,4 +65,11 @@ object NativeBridge {
     /** Types a plain text string (e.g. from a soft-keyboard/IME commitText callback) — the remote
      *  side synthesizes the needed key events per character. */
     external fun inputString(sessionId: String, value: String)
+
+    /** Number of displays (monitors) the peer reported, or 0 if not known yet. */
+    external fun getDisplayCount(sessionId: String): Int
+
+    /** Switches which single display (0-based) this session captures/views — fire-and-forget; the
+     *  new display's size/first frame arrive through the normal getDisplaySize/getFrame polling. */
+    external fun switchDisplay(sessionId: String, display: Int)
 }
