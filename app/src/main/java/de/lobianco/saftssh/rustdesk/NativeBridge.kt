@@ -65,8 +65,10 @@ object NativeBridge {
 
     /** One named key press. [name] is RustDesk's own "VK_*" naming (e.g. "VK_BACK", "VK_RETURN",
      *  "VK_ESCAPE", "VK_TAB", "VK_LEFT"/"VK_UP"/"VK_RIGHT"/"VK_DOWN"). [press] = true sends a
-     *  down+up pair in one call. */
-    external fun inputKey(sessionId: String, name: String, down: Boolean, press: Boolean)
+     *  down+up pair in one call. [ctrl]/[alt] set the keystroke's actual modifier flags — needed
+     *  for printable-character taps, whose remote injection path ignores a separately-held
+     *  modifier key entirely (see IRustDeskSession.inputKey's doc). */
+    external fun inputKey(sessionId: String, name: String, down: Boolean, press: Boolean, ctrl: Boolean, alt: Boolean)
 
     /** Types a plain text string (e.g. from a soft-keyboard/IME commitText callback) — the remote
      *  side synthesizes the needed key events per character. */

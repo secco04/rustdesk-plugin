@@ -21,8 +21,12 @@ interface IRustDeskSession {
      *  REMOTE framebuffer pixels; the caller does the Surface-pixel inverse mapping. */
     oneway void sendMouse(int x, int y, String mouseType, String buttons);
 
-    /** One named key press — RustDesk's own "VK_*" naming (see NativeBridge.inputKey's doc). */
-    oneway void inputKey(String name, boolean down, boolean press);
+    /** One named key press — RustDesk's own "VK_*" naming (see NativeBridge.inputKey's doc).
+     *  [ctrl]/[alt] must be passed here (not just as separate VK_CONTROL/VK_MENU down/up calls) —
+     *  RustDesk's own key-injection path sets a keystroke's actual modifier bits from these flags,
+     *  and for printable-character taps (VK_A.."VK_Z"/VK_0.."VK_9") the remote synthesizes via
+     *  Unicode/character injection, which ignores any separately-held modifier key entirely. */
+    oneway void inputKey(String name, boolean down, boolean press, boolean ctrl, boolean alt);
 
     /** Types a plain text string (e.g. from a soft-keyboard/IME commitText callback). */
     oneway void inputString(String value);
