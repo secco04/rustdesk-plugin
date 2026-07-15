@@ -149,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "jni",
  "rustdesk",
+ "scrap",
  "serde_json 1.0.118",
  "uuid",
 ]

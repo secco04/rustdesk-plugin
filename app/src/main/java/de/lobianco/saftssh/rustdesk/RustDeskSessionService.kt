@@ -5,6 +5,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -24,6 +26,8 @@ private const val NOTIF_ID = 3001
 // blitToSurface() rate-limit when the Surface can't be locked (e.g. display off) — see that
 // function's doc for why this can't be detected proactively.
 private const val BLIT_RETRY_INTERVAL_MS = 2000L
+// Clipboard changes are rare compared to video frames — no need to poll anywhere near as often.
+private const val CLIPBOARD_POLL_INTERVAL_MS = 500L
 // Consecutive failures required before the above backoff engages — see consecutiveBlitFailures'
 // doc: a single resize-triggered miss self-heals on the very next frame and shouldn't cost a
 // multi-second stall; only a sustained run of failures should.
@@ -233,6 +237,54 @@ class RustDeskSessionService : Service() {
         private val videoThread = Thread({ pumpVideo() }, "RustDesk-video-$sessionId").apply {
             isDaemon = true
             start()
+        }
+
+        // Bidirectional clipboard sync (plain text only). Android's clipboard is a SYSTEM-WIDE
+        // service, not per-app — reading/writing it from THIS plugin process observes/affects the
+        // exact same clipboard the main app (or any other app) sees, so no AIDL round-trip is
+        // needed for either direction; it's all local to this process. NativeBridge.pushClipboardText/
+        // pollRemoteClipboardText are deliberately NOT session-scoped in the Rust layer (see their
+        // own docs) — tied to THIS session's lifecycle here only because there's realistically one
+        // active connection at a time.
+        private val clipboardManager: ClipboardManager? = getSystemService(ClipboardManager::class.java)
+        // Guards against the obvious feedback loop: writing the remote's clipboard content into
+        // Android's local clipboard fires our OWN listener below, which would otherwise immediately
+        // push that same content right back out as if it were new local content.
+        @Volatile private var lastClipboardSetByUs: String? = null
+        private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
+            val text = clipboardManager?.primaryClip
+                ?.takeIf { it.itemCount > 0 }
+                ?.getItemAt(0)?.text?.toString()
+            if (!text.isNullOrEmpty() && text != lastClipboardSetByUs) {
+                NativeBridge.pushClipboardText(text)
+            }
+        }
+        private val clipboardPollThread = Thread({ pumpClipboard() }, "RustDesk-clipboard-$sessionId").apply {
+            isDaemon = true
+            start()
+        }
+
+        init {
+            clipboardManager?.addPrimaryClipChangedListener(clipboardListener)
+        }
+
+        /** Polls the peer's clipboard text at a much coarser interval than video (clipboard
+         *  changes are rare compared to frames) and writes it into Android's system clipboard. */
+        private fun pumpClipboard() {
+            try {
+                while (running) {
+                    val text = NativeBridge.pollRemoteClipboardText()
+                    if (text != null) {
+                        lastClipboardSetByUs = text
+                        clipboardManager?.setPrimaryClip(ClipData.newPlainText("RustDesk", text))
+                    }
+                    Thread.sleep(CLIPBOARD_POLL_INTERVAL_MS)
+                }
+            } catch (_: InterruptedException) {
+                // destroy() interrupts this thread to stop it promptly — a clean shutdown, same
+                // reasoning as pumpVideo's identical catch (see its doc).
+                Log.i(TAG, "pumpClipboard($sessionId) interrupted — stopping cleanly")
+            }
         }
 
         /** Same poll-and-blit loop as InfoActivity's test-harness startVideo/blitToSurface, moved
@@ -448,6 +500,8 @@ class RustDeskSessionService : Service() {
         fun destroyInternal() {
             running = false
             videoThread.interrupt()
+            clipboardPollThread.interrupt()
+            clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
             surface = null
             NativeBridge.disconnect(sessionId)
             openSessions.remove(this)

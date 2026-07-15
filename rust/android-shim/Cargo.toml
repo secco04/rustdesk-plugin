@@ -16,6 +16,12 @@ crate-type = ["cdylib"]
 rustdesk = { path = "../rustdesk-upstream", default-features = false, features = ["flutter", "use_dasp"] }
 jni = "0.21"
 uuid = "1"
+# Clipboard sync (bidirectional, plain text): same path as rustdesk-upstream's own `scrap`
+# dependency (../rustdesk-upstream/Cargo.toml), so Cargo unifies it as the SAME compiled crate
+# instance — critical, since push_outgoing_clipboard_text/take_remote_clipboard_text's static
+# Mutex buffers must be the SAME instance client.rs/clipboard.rs read and write, not a separate
+# copy from an independently-resolved dependency.
+scrap = { path = "../rustdesk-upstream/libs/scrap" }
 # M4 (plans/soft-frolicking-thimble.md): builds session_send_mouse's JSON message string. Already
 # pinned in rustdesk-upstream's Cargo.lock (which we copy in before every build), so this adds no
 # new dependency version to resolve.

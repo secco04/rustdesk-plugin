@@ -207,6 +207,43 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_checkOnlin
     })
 }
 
+/// Bidirectional clipboard sync (plain text only): pushes local Android clipboard text so RustDesk's
+/// own existing outgoing-clipboard polling loop (spawned automatically as part of normal peer-info
+/// handling — not Flutter/Dart-isolate-specific, so it already runs for a headless session) picks
+/// it up and sends it to the peer within ~333ms. Call this whenever Android's clipboard changes
+/// (e.g. an OnPrimaryClipChangedListener). Not session-scoped — RustDesk's own buffer this feeds
+/// isn't either.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pushClipboardText<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+) {
+    guard((), move || {
+        let text: String = env.get_string(&text).map(|s| s.into()).unwrap_or_default();
+        scrap::android::ffi::push_outgoing_clipboard_text(text);
+    })
+}
+
+/// Bidirectional clipboard sync: returns the last plain-text clipboard content received from the
+/// peer, or null if nothing new since the last call (clear-on-read — poll this periodically, e.g.
+/// alongside getFrame). Not session-scoped, same as pushClipboardText.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollRemoteClipboardText<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        match scrap::android::ffi::take_remote_clipboard_text() {
+            Some(text) => env
+                .new_string(text)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
+    })
+}
+
 /// Rough connectivity proxy for M2: true once the session has produced at least one video frame.
 /// There is no push-based "connected" event available without a real Dart isolate (see
 /// session_start_headless's doc comment) — a proper sync connection-state getter is still an open

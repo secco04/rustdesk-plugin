@@ -41,6 +41,17 @@ object NativeBridge {
      *  1 (online), 0 (offline), or -1 (unknown — treat as "try connecting anyway", not offline). */
     external fun checkOnline(id: String): Int
 
+    /** Bidirectional clipboard sync (plain text only) — pushes local Android clipboard content so
+     *  RustDesk's own existing outgoing-clipboard polling loop (already running, no extra setup
+     *  needed) picks it up and sends it to the peer within ~333ms. NOT session-scoped — call
+     *  whenever Android's clipboard changes. */
+    external fun pushClipboardText(text: String)
+
+    /** Bidirectional clipboard sync: last plain-text clipboard content received from the peer, or
+     *  null if nothing new since the last call (clear-on-read — poll periodically). NOT
+     *  session-scoped, same as [pushClipboardText]. */
+    external fun pollRemoteClipboardText(): String?
+
     /** Quality/speed — [value] is "best", "balanced", or "low" (RustDesk's own image-quality
      *  values). Live — sends a message to the already-connected peer, no reconnect needed. */
     external fun setImageQuality(sessionId: String, value: String)
