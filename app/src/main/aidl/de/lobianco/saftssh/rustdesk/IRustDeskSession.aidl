@@ -58,6 +58,26 @@ interface IRustDeskSession {
      *  already-connected peer, no reconnect needed. */
     oneway void setQuality(String value);
 
+    /** How the mouse pointer is drawn over the remote picture.
+     *
+     *  [mode] is "host", "local", or "both":
+     *   - "host"  — draw the REAL cursor bitmap the peer sends (so an I-beam over text or a resize
+     *               arrow over a window edge is actually visible, which is the whole point). Falls
+     *               back to the synthetic arrow until the first cursor shape arrives from the peer,
+     *               so the pointer is never invisible (a host that never sends one — e.g. if the
+     *               show-remote-cursor negotiation didn't take — then just behaves like "local").
+     *   - "local" — only the plugin's own synthetic arrow (the pre-existing behaviour).
+     *   - "both"  — host cursor plus the synthetic arrow on top of it.
+     *  Anything else is treated as "host".
+     *
+     *  [syntheticScale] scales BOTH cursors, 1.0 = default. The cursors are deliberately drawn at a
+     *  size independent of the current letterbox/pinch-zoom scale — a remote 32px cursor scaled
+     *  down by the fit-to-view factor would be near-invisible on a phone — so this is the only
+     *  control over how big they appear.
+     *
+     *  oneway: pure render state, same fire-and-forget reasoning as setZoom. */
+    oneway void setCursorOptions(String mode, float syntheticScale);
+
     /** Tears down the connection. oneway: native teardown can block for an unbounded time (same
      *  reasoning as IRemoteDesktopSession.destroy() in the VNC/RDP/Proxmox VE plugin). */
     oneway void destroy();

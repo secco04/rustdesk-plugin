@@ -18,6 +18,7 @@ import android.os.IBinder
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArrayList
 
 private const val TAG = "RustDeskSessionService"
@@ -28,6 +29,13 @@ private const val NOTIF_ID = 3001
 private const val BLIT_RETRY_INTERVAL_MS = 2000L
 // Clipboard changes are rare compared to video frames — no need to poll anywhere near as often.
 private const val CLIPBOARD_POLL_INTERVAL_MS = 500L
+// NativeBridge.pollCursor's blob header: 4 little-endian i32 (width, height, hotx, hoty) ahead of
+// the RGBA pixels. Must match the JNI export's layout exactly.
+private const val CURSOR_HEADER_BYTES = 16
+// The peer's cursor bitmap is drawn at its native pixel size times this, times the user's cursor
+// size setting — NOT times the letterbox/zoom scale (see blitToSurface for why). 2.0 makes a
+// typical 32px desktop cursor ~64px on a phone, roughly matching the synthetic arrow's own size.
+private const val HOST_CURSOR_BASE_SCALE = 2.0f
 // Consecutive failures required before the above backoff engages — see consecutiveBlitFailures'
 // doc: a single resize-triggered miss self-heals on the very next frame and shouldn't cost a
 // multi-second stall; only a sustained run of failures should.
@@ -196,6 +204,20 @@ class RustDeskSessionService : Service() {
         // until the first real position arrives).
         @Volatile private var pointerFbX = -1
         @Volatile private var pointerFbY = -1
+
+        // ── Cursor rendering options (see IRustDeskSession.setCursorOptions) ──
+        // "host" (default) draws the peer's REAL cursor bitmap once one arrives — the only way to
+        // see an I-beam over text or a resize arrow over a window edge, which is exactly why this
+        // was asked for. Until then (and forever, if the peer never sends one) it falls back to the
+        // synthetic arrow, so the pointer is never invisible.
+        @Volatile private var cursorMode = "host"
+        @Volatile private var cursorSizeScale = 1f
+        // Latest cursor shape received from the peer, rebuilt only when NativeBridge.pollCursor
+        // reports a change (it returns null while unchanged). Guarded by renderLock: the video-pump
+        // thread builds/reads it while Binder threads can trigger redraws concurrently.
+        private var hostCursorBitmap: Bitmap? = null
+        private var hostCursorHotX = 0
+        private var hostCursorHotY = 0
         // Throttles cursor-move AND zoom/pan-change redraws to a shared ~60fps budget — same
         // reasoning as VncClient's lastCursorBlitMs: touch delivers move events much faster than
         // that, and every blitToSurface call takes the same Surface lock the video-pump thread
@@ -329,6 +351,10 @@ class RustDeskSessionService : Service() {
                         }
                         fresh
                     } ?: continue
+                    // Cursor shape changes arrive independently of video frames (moving the mouse
+                    // over a text field changes the cursor without necessarily redrawing anything),
+                    // so poll it every iteration rather than only alongside a new frame.
+                    val cursorChanged = pollHostCursor()
                     val frame = NativeBridge.getFrame(sessionId, display)
                     if (frame == null) {
                         // No new server frame — but if a recent resize's redraw couldn't land yet
@@ -337,6 +363,11 @@ class RustDeskSessionService : Service() {
                         // any input.
                         if (pendingResizeRedraw) {
                             pendingResizeRedraw = currentBitmap?.let { !blitToSurface(it) } ?: false
+                        } else if (cursorChanged) {
+                            // A new cursor shape with no new frame (static screen) still has to be
+                            // drawn, or the I-beam/resize arrow wouldn't appear until something else
+                            // happened to trigger a redraw.
+                            currentBitmap?.let { blitToSurface(it) }
                         }
                         Thread.sleep(16)
                         continue
@@ -354,6 +385,41 @@ class RustDeskSessionService : Service() {
                 // RustDesk-video thread, process ended, right after a disconnect).
                 Log.i(TAG, "pumpVideo($sessionId) interrupted — stopping cleanly")
             }
+        }
+
+        /** Picks up a new cursor shape from the peer, if one arrived since the last call. Returns
+         *  true when [hostCursorBitmap] actually changed, so the caller knows a redraw is needed
+         *  even with no new video frame.
+         *
+         *  NativeBridge.pollCursor returns null while unchanged (clear-on-read polling, same shape
+         *  as getFrame / pollRemoteClipboardText), else a blob of 4 little-endian i32 — width,
+         *  height, hotx, hoty — followed by width*height*4 RGBA bytes. */
+        private fun pollHostCursor(): Boolean {
+            val blob = NativeBridge.pollCursor(sessionId) ?: return false
+            if (blob.size < CURSOR_HEADER_BYTES) {
+                Log.w(TAG, "pollCursor($sessionId): blob too small (${blob.size} bytes), ignoring")
+                return false
+            }
+            val buf = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN)
+            val w = buf.int
+            val h = buf.int
+            val hotX = buf.int
+            val hotY = buf.int
+            if (w <= 0 || h <= 0 || blob.size != CURSOR_HEADER_BYTES + w * h * 4) {
+                Log.w(TAG, "pollCursor($sessionId): malformed cursor w=$w h=$h size=${blob.size}, ignoring")
+                return false
+            }
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            // The peer's cursor pixels are RGBA, which is exactly ARGB_8888's in-memory byte
+            // layout — same as getFrame's video pixels, so no channel swizzle is needed. buf's
+            // position is already past the header, which is where copyPixelsFromBuffer reads from.
+            bmp.copyPixelsFromBuffer(buf)
+            synchronized(renderLock) {
+                hostCursorBitmap = bmp
+                hostCursorHotX = hotX
+                hostCursorHotY = hotY
+            }
+            return true
         }
 
         /** Draws [bitmap] into the current Surface at the base letterbox fit (recomputed from the
@@ -404,7 +470,34 @@ class RustDeskSessionService : Service() {
                         canvas.drawColor(Color.BLACK)
                         canvas.drawBitmap(bitmap, null, RectF(ox, oy, ox + dw, oy + dh), null)
                         if (pointerFbX >= 0 && pointerFbY >= 0) {
-                            SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                            val cx = ox + pointerFbX * scale
+                            val cy = oy + pointerFbY * scale
+                            val host = hostCursorBitmap
+                            // Draw the peer's real cursor whenever we have one and the mode wants it.
+                            val drawHost = host != null && (cursorMode == "host" || cursorMode == "both")
+                            if (host != null && drawHost) {
+                                // Deliberately sized independently of `scale` (the letterbox fit *
+                                // pinch zoom): a 32px remote cursor multiplied by a typical
+                                // fit-to-view factor of ~0.3 would render ~10px on a phone, far too
+                                // small to tell an I-beam from an arrow — which is the entire point
+                                // of showing the host's shape. cursorSizeScale is the user's control.
+                                val cs = HOST_CURSOR_BASE_SCALE * cursorSizeScale
+                                // hotx/hoty is the cursor's "active point" (the arrow's tip, an
+                                // I-beam's centre) and must land exactly on the pointer position.
+                                val left = cx - hostCursorHotX * cs
+                                val top = cy - hostCursorHotY * cs
+                                canvas.drawBitmap(
+                                    host, null,
+                                    RectF(left, top, left + host.width * cs, top + host.height * cs),
+                                    null,
+                                )
+                            }
+                            // Synthetic arrow: always in "local"/"both", and as the fallback in
+                            // "host" mode until a real cursor arrives (or forever, if the peer never
+                            // sends one) so the pointer is never invisible — see setCursorOptions.
+                            if (cursorMode == "local" || cursorMode == "both" || !drawHost) {
+                                SyntheticCursor.draw(canvas, cx, cy, cursorSizeScale)
+                            }
                         }
                         if (!loggedFirstBlit) {
                             loggedFirstBlit = true
@@ -530,6 +623,21 @@ class RustDeskSessionService : Service() {
         override fun setQuality(value: String?) {
             if (!isCallerAuthorized()) return
             NativeBridge.setImageQuality(sessionId, value.orEmpty())
+        }
+
+        override fun setCursorOptions(mode: String?, syntheticScale: Float) {
+            if (!isCallerAuthorized()) return
+            cursorMode = when (mode) {
+                "local", "both", "host" -> mode
+                else -> "host"
+            }
+            // Guard against a nonsense scale from a bad caller making the cursor invisible or
+            // absurdly huge; the settings UI already clamps, this is just defence in depth.
+            cursorSizeScale = syntheticScale.coerceIn(0.25f, 5f)
+            // Pure render state — redraw the last frame immediately so the change is visible at
+            // once, rather than only on the next server frame (a static remote screen sends none;
+            // same reasoning as updateSurface's redraw).
+            currentBitmap?.let { blitToSurface(it) }
         }
 
         override fun destroy() {

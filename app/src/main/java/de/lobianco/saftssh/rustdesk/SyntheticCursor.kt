@@ -9,11 +9,14 @@ import android.graphics.Path
  * Draws a synthetic mouse-pointer arrow onto a Surface canvas at a given position — ported
  * byte-for-byte from remote-desktop-plugin's VncClient/RdpClient equivalent (see that project's
  * own copy for the full doc) so the user always sees where the pointer is: RustDesk's own peer
- * bakes no cursor into the framebuffer for us (we bypass its own cursor-shape channel entirely
- * since we never wired session_get_platform's cursor callbacks in this headless setup), and a
- * locally-drawn arrow at the last position we sent via sendMouse is always visible and always
- * tracks the finger — essential for the trackpad-style CURSOR input mode, where the tap position
- * is NOT where the finger physically is.
+ * bakes no cursor into the framebuffer for us, and a locally-drawn arrow at the last position we
+ * sent via sendMouse is always visible and always tracks the finger — essential for the
+ * trackpad-style CURSOR input mode, where the tap position is NOT where the finger physically is.
+ *
+ * This is now only one of the options: the peer's REAL cursor bitmap can be shown instead (or as
+ * well), which is the only way to see an I-beam over text or a resize arrow over a window edge —
+ * see IRustDeskSession.setCursorOptions and RustDeskSessionService's host-cursor rendering. This
+ * synthetic arrow stays the fallback whenever no host cursor has arrived (yet).
  */
 object SyntheticCursor {
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -26,20 +29,23 @@ object SyntheticCursor {
         strokeWidth = 3f
     }
 
-    // Classic arrow outline with its tip at (0,0), in a roughly 12x19 unit box, scaled up for
-    // visibility on high-DPI phone screens.
-    private const val S = 2.4f
+    // Classic arrow outline with its tip at (0,0), in a roughly 12x19 unit box. BASE is the
+    // long-standing default scale-up for visibility on high-DPI phone screens; the caller's
+    // sizeScale multiplies it, so sizeScale = 1.0 keeps exactly the size this always drew at.
+    private const val BASE = 2.4f
 
-    /** Draws the arrow with its tip (hotspot) at surface pixel ([tipX], [tipY]). */
-    fun draw(canvas: Canvas, tipX: Float, tipY: Float) {
+    /** Draws the arrow with its tip (hotspot) at surface pixel ([tipX], [tipY]), at [sizeScale]
+     *  times the default size (1.0 = default). */
+    fun draw(canvas: Canvas, tipX: Float, tipY: Float, sizeScale: Float = 1f) {
+        val s = BASE * sizeScale
         val path = Path().apply {
             moveTo(0f, 0f)
-            lineTo(0f, 16f * S)
-            lineTo(4f * S, 12.5f * S)
-            lineTo(7f * S, 19f * S)
-            lineTo(9.5f * S, 18f * S)
-            lineTo(6.5f * S, 11.5f * S)
-            lineTo(11f * S, 11.5f * S)
+            lineTo(0f, 16f * s)
+            lineTo(4f * s, 12.5f * s)
+            lineTo(7f * s, 19f * s)
+            lineTo(9.5f * s, 18f * s)
+            lineTo(6.5f * s, 11.5f * s)
+            lineTo(11f * s, 11.5f * s)
             close()
             offset(tipX, tipY)
         }
