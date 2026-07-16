@@ -55,6 +55,22 @@ interface IRustDeskFileTransferSession {
     /** Cancels an in-progress job. */
     oneway void cancelJob(int jobId);
 
+    /** Creates a directory at the full remote [path] on the peer. [jobId] ties the resulting
+     *  onJobEvent (done/error) back to this call — NOT shown as a transfer in a progress list,
+     *  this is a one-shot fire-and-forget action, but it reports through the same channel a
+     *  transfer's completion does since the native layer has no separate signal for it. */
+    oneway void createRemoteDir(int jobId, String path);
+
+    /** Removes a single remote file ([isDir] = false) or empty remote directory ([isDir] = true)
+     *  at [path]. Recursive directory deletion is intentionally out of scope — deleting a
+     *  non-empty directory fails, reported as an onJobEvent error. [jobId] ties the result back to
+     *  this call, same as [createRemoteDir]. */
+    oneway void removeRemoteFile(int jobId, String path, boolean isDir);
+
+    /** Renames the remote entry at [path] to [newName] (a bare name, not a full path — stays in
+     *  the same directory). [jobId] ties the result back to this call, same as [createRemoteDir]. */
+    oneway void renameRemoteFile(int jobId, String path, String newName);
+
     /** Tears down this file-transfer session (does not affect any remote-control IRustDeskSession
      *  to the same peer — they're independent connections). */
     oneway void destroy();

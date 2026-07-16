@@ -908,6 +908,21 @@ class RustDeskSessionService : Service() {
             downloadTempFiles.remove(jobId)?.first?.delete()
         }
 
+        override fun createRemoteDir(jobId: Int, path: String) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.ftCreateRemoteDir(sessionId, jobId, path)
+        }
+
+        override fun removeRemoteFile(jobId: Int, path: String, isDir: Boolean) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.ftRemoveRemoteFile(sessionId, jobId, path, isDir)
+        }
+
+        override fun renameRemoteFile(jobId: Int, path: String, newName: String) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.ftRenameRemoteFile(sessionId, jobId, path, newName)
+        }
+
         override fun destroy() {
             if (!isCallerAuthorized()) return
             destroyInternal()
