@@ -223,6 +223,12 @@ class RustDeskSessionService : Service() {
         // Escalating only after several consecutive failures keeps the real display-off protection
         // (task #43) while no longer punishing a one-off resize-induced miss.
         @Volatile private var consecutiveBlitFailures = 0
+        // Set when a resize's immediate redraw (see updateSurface) couldn't land because the
+        // just-resized BufferQueue transiently rejected the buffer — makes pumpVideo re-attempt the
+        // redraw of the last frame on its idle (no-new-frame) path until it succeeds, so a STATIC
+        // remote screen re-fits into the newly shrunk Surface without waiting for a server frame or
+        // any user input.
+        @Volatile private var pendingResizeRedraw = false
         // Multi-monitor: which display index pumpVideo currently polls/renders. switchDisplay()
         // bumps this AND clears currentBitmap + announcedConnected so pumpVideo re-runs its
         // "discover size, then announce onConnected" sequence exactly like a fresh connect —
@@ -318,6 +324,13 @@ class RustDeskSessionService : Service() {
                     } ?: continue
                     val frame = NativeBridge.getFrame(sessionId, display)
                     if (frame == null) {
+                        // No new server frame — but if a recent resize's redraw couldn't land yet
+                        // (see pendingResizeRedraw / updateSurface), keep retrying it here so a
+                        // static remote screen still re-fits into the shrunk Surface without needing
+                        // any input.
+                        if (pendingResizeRedraw) {
+                            pendingResizeRedraw = currentBitmap?.let { !blitToSurface(it) } ?: false
+                        }
                         Thread.sleep(16)
                         continue
                     }
@@ -336,17 +349,21 @@ class RustDeskSessionService : Service() {
             }
         }
 
-        private fun blitToSurface(bitmap: Bitmap) {
+        /** Draws [bitmap] into the current Surface at the base letterbox fit (recomputed from the
+         *  CURRENT canvas size every call) times the pinch-zoom transform. Returns true only if the
+         *  frame actually reached the Surface — updateSurface / pumpVideo use that to know whether a
+         *  post-resize redraw landed or still needs retrying (see pendingResizeRedraw). */
+        private fun blitToSurface(bitmap: Bitmap): Boolean {
             val s = surface ?: run {
                 Log.w(TAG, "blitToSurface($sessionId): no surface set yet — nothing to draw onto")
-                return
+                return false
             }
             if (!s.isValid) {
                 Log.w(TAG, "blitToSurface($sessionId): surface is not valid (torn down?), skipping frame")
-                return
+                return false
             }
             val now = System.currentTimeMillis()
-            if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
+            if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return false
             lastBlitAttemptMs = now
             try {
                 // Serializes against the OTHER threads that can call this concurrently (video-pump
@@ -356,7 +373,7 @@ class RustDeskSessionService : Service() {
                     val canvas: Canvas = s.lockCanvas(null) ?: run {
                         Log.w(TAG, "blitToSurface($sessionId): lockCanvas() returned null")
                         registerBlitFailure()
-                        return
+                        return false
                     }
                     try {
                         val sw = canvas.width.toFloat()
@@ -387,6 +404,7 @@ class RustDeskSessionService : Service() {
                 }
                 consecutiveBlitFailures = 0
                 blitFailing = false
+                return true
             } catch (e: Exception) {
                 // Surface torn down mid-blit (e.g. caller backgrounded) is expected and self-heals
                 // on the next frame — but log it (rate-limited) so a PERSISTENT failure (e.g. the
@@ -397,6 +415,7 @@ class RustDeskSessionService : Service() {
                 if (blitFailLogCount <= 5 || blitFailLogCount % 50 == 0) {
                     Log.w(TAG, "blitToSurface($sessionId) failed (#$blitFailLogCount): ${e.javaClass.simpleName}: ${e.message}")
                 }
+                return false
             }
         }
 
@@ -417,6 +436,20 @@ class RustDeskSessionService : Service() {
             // a fresh Surface after the app resumed) — same reasoning as VncClient's identical fix.
             blitFailing = false
             consecutiveBlitFailures = 0
+            // updateSurface also fires on every RESIZE (RustDeskScreen calls it from
+            // SurfaceHolder.surfaceChanged) — opening the IME / special-key bar / text-input bar
+            // shrinks this Surface (see RustDeskScreen's bottomStackHeight padding). blitToSurface
+            // recomputes its base letterbox fit from the CURRENT canvas size every call, so
+            // redrawing the last frame here re-fits the WHOLE remote screen into the shrunk area
+            // (scaled down — host taskbar and cursor stay visible, nothing hidden behind the bars).
+            // Without this, a STATIC remote desktop (no new server frames, no mouse/zoom event)
+            // kept the last frame drawn at the OLD, larger size until the user moved the cursor,
+            // which is what re-triggered a redraw — reported as having to "reposition first" before
+            // the bottom of the picture reappeared. If the just-resized BufferQueue transiently
+            // rejects this immediate redraw (see consecutiveBlitFailures' doc), pendingResizeRedraw
+            // makes pumpVideo keep retrying until it lands, so it re-fits within a frame or two with
+            // no input either way.
+            pendingResizeRedraw = currentBitmap?.let { !blitToSurface(it) } ?: false
         }
 
         override fun sendMouse(x: Int, y: Int, mouseType: String?, buttons: String?) {
