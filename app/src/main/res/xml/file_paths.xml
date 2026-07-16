@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Covers RustDeskSessionService's ft_download_<jobId> temp files, which live directly in
+    this app's internal files/ root (File(filesDir, "ft_download_$jobId")) — see
+    IRustDeskFileTransferSession.downloadFile's doc for why the main app sometimes needs a
+    content:// Uri onto one of these instead of it being finalized into MediaStore.Downloads.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="ft_downloads" path="." />
+</paths>

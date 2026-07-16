@@ -38,6 +38,8 @@ private const val CLIPBOARD_POLL_INTERVAL_MS = 500L
 // NativeBridge.pollCursor's blob header: 4 little-endian i32 (width, height, hotx, hoty) ahead of
 // the RGBA pixels. Must match the JNI export's layout exactly.
 private const val CURSOR_HEADER_BYTES = 16
+// Must match AndroidManifest.xml's <provider android:authorities="...">.
+private const val FILE_PROVIDER_AUTHORITY = "de.lobianco.saftssh.rustdesk.fileprovider"
 // The peer's cursor bitmap is drawn at its native pixel size times this, times the user's cursor
 // size setting — NOT times the letterbox/zoom scale (see blitToSurface for why). 2.0 makes a
 // typical 32px desktop cursor ~64px on a phone, roughly matching the synthetic arrow's own size.
@@ -734,7 +736,12 @@ class RustDeskSessionService : Service() {
         // side is writing into, moved into MediaStore.Downloads (or left in place pre-Android 10)
         // once the transfer completes.
         private val uploadTempFiles = java.util.concurrent.ConcurrentHashMap<Int, File>()
-        private val downloadTempFiles = java.util.concurrent.ConcurrentHashMap<Int, Pair<File, String>>()
+        private val downloadTempFiles = java.util.concurrent.ConcurrentHashMap<Int, DownloadTempFile>()
+
+        /** [toCustomDestination] mirrors the same-named [downloadFile] param — decides whether
+         *  [handleJobEvent] finalizes into MediaStore.Downloads or hands back a FileProvider Uri
+         *  (see [downloadFile]'s doc). */
+        private data class DownloadTempFile(val file: File, val suggestedName: String, val toCustomDestination: Boolean)
 
         private val pollThread = Thread({ pumpFileTransferEvents() }, "RustDesk-ft-$sessionId").apply {
             isDaemon = true
@@ -791,15 +798,19 @@ class RustDeskSessionService : Service() {
                 uploadTempFiles.remove(jobId)?.let { tempFile ->
                     tempFile.delete()
                 }
-                downloadTempFiles.remove(jobId)?.let { (tempFile, suggestedName) ->
+                downloadTempFiles.remove(jobId)?.let { pending ->
                     if (type == "done") {
-                        val savedUri = saveDownloadToMediaStore(tempFile, suggestedName)
+                        val savedUri = if (pending.toCustomDestination) {
+                            grantDownloadedFileUri(jobId, pending.file)
+                        } else {
+                            saveDownloadToMediaStore(pending.file, pending.suggestedName)
+                        }
                         val augmented = JSONObject(json).put("savedUri", savedUri)
                         runCatching { callback?.onJobEvent(augmented.toString()) }
                             .onFailure { Log.w(TAG, "onJobEvent callback failed: ${it.message}") }
                         return
                     } else {
-                        tempFile.delete()
+                        pending.file.delete()
                     }
                 }
             }
@@ -870,14 +881,48 @@ class RustDeskSessionService : Service() {
             }, "RustDesk-ft-upload-$jobId").apply { isDaemon = true; start() }
         }
 
-        override fun downloadFile(jobId: Int, remotePath: String, suggestedFileName: String, includeHidden: Boolean) {
+        override fun downloadFile(jobId: Int, remotePath: String, suggestedFileName: String, includeHidden: Boolean, toCustomDestination: Boolean) {
             if (!isCallerAuthorized()) return
             val tempFile = File(filesDir, "ft_download_$jobId")
-            downloadTempFiles[jobId] = tempFile to suggestedFileName
+            downloadTempFiles[jobId] = DownloadTempFile(tempFile, suggestedFileName, toCustomDestination)
             val started = NativeBridge.ftSendFiles(sessionId, jobId, tempFile.absolutePath, remotePath, false, includeHidden)
             if (!started) {
                 downloadTempFiles.remove(jobId)
                 reportLocalError(jobId, "Failed to start download")
+            }
+        }
+
+        /** See [downloadFile]'s doc for [toCustomDestination] — grants the caller (the main app)
+         *  read access to [tempFile] via [de.lobianco.saftssh.rustdesk.fileProviderAuthority]'s
+         *  FileProvider, and remembers it in [pendingReleaseFiles] so [releaseDownloadedFile] can
+         *  clean it up once the caller has finished reading it. Never auto-deletes on its own — the
+         *  caller may need more than a moment to stream a large file. */
+        private fun grantDownloadedFileUri(jobId: Int, tempFile: File): String? {
+            return try {
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    this@RustDeskSessionService,
+                    FILE_PROVIDER_AUTHORITY,
+                    tempFile,
+                )
+                grantUriPermission("de.lobianco.saftssh", uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                pendingReleaseFiles[jobId] = uri to tempFile
+                uri.toString()
+            } catch (e: Exception) {
+                Log.w(TAG, "grantDownloadedFileUri($jobId) failed: ${e.javaClass.simpleName}: ${e.message}")
+                tempFile.delete()
+                null
+            }
+        }
+
+        /** Uris/files handed back via [grantDownloadedFileUri], awaiting the caller's
+         *  [releaseDownloadedFile] call. */
+        private val pendingReleaseFiles = java.util.concurrent.ConcurrentHashMap<Int, Pair<Uri, File>>()
+
+        override fun releaseDownloadedFile(jobId: Int) {
+            if (!isCallerAuthorized()) return
+            pendingReleaseFiles.remove(jobId)?.let { (uri, file) ->
+                runCatching { revokeUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                file.delete()
             }
         }
 
@@ -905,7 +950,11 @@ class RustDeskSessionService : Service() {
             if (!isCallerAuthorized()) return
             NativeBridge.ftCancelJob(sessionId, jobId)
             uploadTempFiles.remove(jobId)?.delete()
-            downloadTempFiles.remove(jobId)?.first?.delete()
+            downloadTempFiles.remove(jobId)?.file?.delete()
+            pendingReleaseFiles.remove(jobId)?.let { (uri, file) ->
+                runCatching { revokeUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                file.delete()
+            }
         }
 
         override fun createRemoteDir(jobId: Int, path: String) {
@@ -935,8 +984,13 @@ class RustDeskSessionService : Service() {
             pollThread.interrupt()
             uploadTempFiles.values.forEach { it.delete() }
             uploadTempFiles.clear()
-            downloadTempFiles.values.forEach { it.first.delete() }
+            downloadTempFiles.values.forEach { it.file.delete() }
             downloadTempFiles.clear()
+            pendingReleaseFiles.values.forEach { (uri, file) ->
+                runCatching { revokeUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                file.delete()
+            }
+            pendingReleaseFiles.clear()
             NativeBridge.disconnect(sessionId)
             openFileTransferSessions.remove(this)
             demoteFromForegroundIfIdle()

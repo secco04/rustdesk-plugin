@@ -53,6 +53,25 @@
             </intent-filter>
         </service>
 
+        <!--
+            Hands a finished download's temp file back to the main app as a content:// Uri when the
+            caller wants it saved somewhere OTHER than the system Downloads folder (the
+            dual-pane file manager's "paste into whatever local folder I'm browsing" flow) — see
+            IRustDeskFileTransferSession.downloadFile's doc. Not exported; access is granted
+            per-file via grantUriPermission, the standard FileProvider pattern, same reasoning as
+            why the session service itself needs no custom permission (a broad "can read any of
+            this provider's files" grant would be the wrong shape here anyway).
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="de.lobianco.saftssh.rustdesk.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 
 </manifest>
