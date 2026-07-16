@@ -169,6 +169,13 @@ class RustDeskSessionService : Service() {
         @Volatile private var running = true
         private var announcedConnected = false
         private var loggedFirstBlit = false
+        // Diagnostic (Round 26): logs whenever the canvas (Surface) dimensions actually change, to
+        // confirm on-device whether opening the IME / special-key bar really resizes the Surface
+        // (so blitToSurface re-fits the whole picture into the smaller area) or whether the Surface
+        // stays full-size and the bars just overlay the bottom — the open question behind the
+        // reported "bars still cover the view".
+        private var lastLoggedCanvasW = 0
+        private var lastLoggedCanvasH = 0
         private var blitFailLogCount = 0
 
         // Pinch-zoom transform (see setZoom / IRustDeskSession.setZoom). scale is relative to the
@@ -378,6 +385,11 @@ class RustDeskSessionService : Service() {
                     try {
                         val sw = canvas.width.toFloat()
                         val sh = canvas.height.toFloat()
+                        if (canvas.width != lastLoggedCanvasW || canvas.height != lastLoggedCanvasH) {
+                            Log.i(TAG, "blitToSurface($sessionId): canvas size now ${canvas.width}x${canvas.height} (was ${lastLoggedCanvasW}x$lastLoggedCanvasH)")
+                            lastLoggedCanvasW = canvas.width
+                            lastLoggedCanvasH = canvas.height
+                        }
                         // Base letterbox fit * pinch-zoom on top (see setZoom / VncClient.blitToSurface).
                         // RustDeskScreen owns zoomScale/panX/panY and applies the SAME transform in its
                         // touch inverse-map, so taps land correctly while zoomed.
