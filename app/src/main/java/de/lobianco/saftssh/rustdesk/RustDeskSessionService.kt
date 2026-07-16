@@ -40,6 +40,12 @@ private const val CLIPBOARD_POLL_INTERVAL_MS = 500L
 private const val CURSOR_HEADER_BYTES = 16
 // Must match AndroidManifest.xml's <provider android:authorities="...">.
 private const val FILE_PROVIDER_AUTHORITY = "de.lobianco.saftssh.rustdesk.fileprovider"
+
+/** [toCustomDestination] mirrors the same-named [IRustDeskFileTransferSession.downloadFile] param
+ *  — decides whether a finished download is finalized into MediaStore.Downloads or handed back as
+ *  a FileProvider Uri (see that method's doc). File-scoped rather than nested inside
+ *  RustDeskFileTransferSessionImpl since Kotlin doesn't allow nested classes inside an inner class. */
+private data class DownloadTempFile(val file: File, val suggestedName: String, val toCustomDestination: Boolean)
 // The peer's cursor bitmap is drawn at its native pixel size times this, times the user's cursor
 // size setting — NOT times the letterbox/zoom scale (see blitToSurface for why). 2.0 makes a
 // typical 32px desktop cursor ~64px on a phone, roughly matching the synthetic arrow's own size.
@@ -737,11 +743,6 @@ class RustDeskSessionService : Service() {
         // once the transfer completes.
         private val uploadTempFiles = java.util.concurrent.ConcurrentHashMap<Int, File>()
         private val downloadTempFiles = java.util.concurrent.ConcurrentHashMap<Int, DownloadTempFile>()
-
-        /** [toCustomDestination] mirrors the same-named [downloadFile] param — decides whether
-         *  [handleJobEvent] finalizes into MediaStore.Downloads or hands back a FileProvider Uri
-         *  (see [downloadFile]'s doc). */
-        private data class DownloadTempFile(val file: File, val suggestedName: String, val toCustomDestination: Boolean)
 
         private val pollThread = Thread({ pumpFileTransferEvents() }, "RustDesk-ft-$sessionId").apply {
             isDaemon = true
