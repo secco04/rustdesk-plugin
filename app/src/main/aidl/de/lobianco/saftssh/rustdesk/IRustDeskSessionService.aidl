@@ -5,6 +5,8 @@ package de.lobianco.saftssh.rustdesk;
 import android.view.Surface;
 import de.lobianco.saftssh.rustdesk.IRustDeskSession;
 import de.lobianco.saftssh.rustdesk.IRustDeskSessionCallback;
+import de.lobianco.saftssh.rustdesk.IRustDeskFileTransferSession;
+import de.lobianco.saftssh.rustdesk.IRustDeskFileTransferCallback;
 
 interface IRustDeskSessionService {
     /**
@@ -44,5 +46,22 @@ interface IRustDeskSessionService {
         String relayServer,
         String apiServer,
         String key
+    );
+
+    /**
+     * Opens a SEPARATE file-transfer connection to the same peer — see
+     * IRustDeskFileTransferSession's doc for why this can't ride on an existing createSession()
+     * connection (RustDesk's own protocol silently drops file-transfer messages on a normal
+     * control connection; the host must also have "Enable file transfer" on for this account).
+     * Returns null if the connection could not even be started (see logcat).
+     */
+    IRustDeskFileTransferSession createFileTransferSession(
+        String id,
+        String password,
+        String idServer,
+        String relayServer,
+        String apiServer,
+        String key,
+        in IRustDeskFileTransferCallback callback
     );
 }

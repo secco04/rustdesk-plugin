@@ -7,19 +7,25 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.RectF
+import android.net.Uri
 import android.os.Binder
 import android.os.Build
+import android.os.Environment
 import android.os.IBinder
+import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArrayList
+import org.json.JSONObject
 
 private const val TAG = "RustDeskSessionService"
 private const val NOTIF_CHANNEL_ID = "rustdesk_session"
@@ -40,6 +46,9 @@ private const val HOST_CURSOR_BASE_SCALE = 2.0f
 // doc: a single resize-triggered miss self-heals on the very next frame and shouldn't cost a
 // multi-second stall; only a sustained run of failures should.
 private const val BLIT_FAILURE_ESCALATION_THRESHOLD = 3
+// File-transfer events (dir listings, job progress/done/error, overwrite prompts) are far rarer
+// than video frames — no need to poll anywhere near that often.
+private const val FILE_TRANSFER_POLL_INTERVAL_MS = 250L
 
 /** IMPORTANT: this check must live in the AIDL Stub's method bodies, NOT in Service.onBind() —
  *  onBind() is a local lifecycle callback dispatched by this process's own ActivityThread, not a
@@ -64,6 +73,7 @@ class RustDeskSessionService : Service() {
     // foregroundServiceType="specialUse" + FOREGROUND_SERVICE(_SPECIAL_USE) permissions were already
     // in place for this, just never wired up on the Kotlin side.
     private val openSessions = CopyOnWriteArrayList<RustDeskSessionImpl>()
+    private val openFileTransferSessions = CopyOnWriteArrayList<RustDeskFileTransferSessionImpl>()
 
     override fun onCreate() {
         super.onCreate()
@@ -75,6 +85,8 @@ class RustDeskSessionService : Service() {
     override fun onDestroy() {
         openSessions.forEach { runCatching { it.destroyInternal() } }
         openSessions.clear()
+        openFileTransferSessions.forEach { runCatching { it.destroyInternal() } }
+        openFileTransferSessions.clear()
         super.onDestroy()
     }
 
@@ -114,7 +126,7 @@ class RustDeskSessionService : Service() {
     }
 
     private fun demoteFromForegroundIfIdle() {
-        if (openSessions.isEmpty()) stopForeground(STOP_FOREGROUND_REMOVE)
+        if (openSessions.isEmpty() && openFileTransferSessions.isEmpty()) stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
     /** True if the app on the other end of the CURRENT incoming Binder transaction is an
@@ -165,6 +177,36 @@ class RustDeskSessionService : Service() {
             if (!isCallerAuthorized()) return -1
             NativeBridge.setServerConfig(idServer, relayServer, apiServer, key)
             return NativeBridge.checkOnline(id)
+        }
+
+        override fun createFileTransferSession(
+            id: String,
+            password: String,
+            idServer: String,
+            relayServer: String,
+            apiServer: String,
+            key: String,
+            callback: IRustDeskFileTransferCallback?
+        ): IRustDeskFileTransferSession? {
+            if (!isCallerAuthorized()) return null
+            NativeBridge.setServerConfig(idServer, relayServer, apiServer, key)
+            val result = NativeBridge.connectFileTransfer(id, password)
+            if (result.startsWith("ERR:")) {
+                val reason = result.removePrefix("ERR:")
+                Log.e(TAG, "connectFileTransfer($id) failed: $reason")
+                runCatching { callback?.onDisconnected(reason) }
+                return null
+            }
+            // Deliberately NOT calling callback.onConnected() here — same reasoning as the main
+            // createSession(): this only means the request was accepted and headless start was
+            // invoked, not that the peer handshake actually succeeded. There's no video "first
+            // frame" equivalent to wait for here; the caller should issue an initial readRemoteDir
+            // and treat the first onDirListing arrival as its real "connected" signal (with its own
+            // client-side timeout, same pattern as RustDeskViewModel.CONNECT_TIMEOUT_MS).
+            val session = RustDeskFileTransferSessionImpl(result, callback)
+            openFileTransferSessions.add(session)
+            promoteToForeground()
+            return session
         }
     }
 
@@ -659,6 +701,229 @@ class RustDeskSessionService : Service() {
             surface = null
             NativeBridge.disconnect(sessionId)
             openSessions.remove(this)
+            demoteFromForegroundIfIdle()
+        }
+    }
+
+    /** One file-transfer connection to a peer — see IRustDeskFileTransferSession's doc for why
+     *  this is a wholly separate session type from [RustDeskSessionImpl] (remote control/video),
+     *  not a mode flag on it. A single background thread both polls the native layer for events
+     *  (dir listings / job progress-done-error / overwrite prompts) and does the local staging
+     *  work uploads/downloads need (copying a picked file in, inserting a finished download into
+     *  MediaStore.Downloads) — none of this is remotely as latency-sensitive as video, so one
+     *  thread per session is plenty; unlike RustDeskSessionImpl there's no separate render loop to
+     *  keep responsive. */
+    private inner class RustDeskFileTransferSessionImpl(
+        private val sessionId: String,
+        private val callback: IRustDeskFileTransferCallback?,
+    ) : IRustDeskFileTransferSession.Stub() {
+
+        @Volatile private var running = true
+        // Fires callback.onConnected() exactly once, the first time ANY event is actually drained
+        // from the native layer — the earliest real evidence this session reached the peer at all
+        // (connectFileTransfer succeeding only means the request was accepted locally, same
+        // caveat as the main session's createSession). No video "first frame" equivalent exists
+        // here, so this is the closest analogue; the caller is expected to kick off an initial
+        // readRemoteDir right after creating the session so this actually has something to wait for.
+        @Volatile private var announcedConnected = false
+
+        // Tracks local staging files this session created, so they can be cleaned up once the
+        // matching job finishes (success or failure) instead of leaking temp files across a long
+        // session. Upload: the copy made from the caller's granted content Uri, deleted once the
+        // native side has read it (job done/error either way). Download: the temp file the native
+        // side is writing into, moved into MediaStore.Downloads (or left in place pre-Android 10)
+        // once the transfer completes.
+        private val uploadTempFiles = java.util.concurrent.ConcurrentHashMap<Int, File>()
+        private val downloadTempFiles = java.util.concurrent.ConcurrentHashMap<Int, Pair<File, String>>()
+
+        private val pollThread = Thread({ pumpFileTransferEvents() }, "RustDesk-ft-$sessionId").apply {
+            isDaemon = true
+            start()
+        }
+
+        private fun pumpFileTransferEvents() {
+            try {
+                while (running) {
+                    var gotAny = false
+
+                    NativeBridge.ftPollDirListing(sessionId)?.let { json ->
+                        gotAny = true
+                        runCatching { callback?.onDirListing(json) }
+                            .onFailure { Log.w(TAG, "onDirListing callback failed: ${it.message}") }
+                    }
+
+                    NativeBridge.ftPollJobEvent(sessionId)?.let { json ->
+                        gotAny = true
+                        handleJobEvent(json)
+                    }
+
+                    NativeBridge.ftPollOverrideConfirm(sessionId)?.let { json ->
+                        gotAny = true
+                        runCatching { callback?.onOverrideConfirm(json) }
+                            .onFailure { Log.w(TAG, "onOverrideConfirm callback failed: ${it.message}") }
+                    }
+
+                    if (gotAny && !announcedConnected) {
+                        announcedConnected = true
+                        runCatching { callback?.onConnected() }
+                    }
+
+                    Thread.sleep(FILE_TRANSFER_POLL_INTERVAL_MS)
+                }
+            } catch (_: InterruptedException) {
+                // destroy() interrupts this thread to stop it promptly — a clean shutdown, same
+                // reasoning as pumpVideo's identical catch in RustDeskSessionImpl.
+                Log.i(TAG, "pumpFileTransferEvents($sessionId) interrupted — stopping cleanly")
+            }
+        }
+
+        /** Intercepts done/error events for jobs THIS session is staging locally (uploads/
+         *  downloads), to clean up temp files and — for a finished download — insert it into
+         *  MediaStore.Downloads, before forwarding an (possibly augmented) event to the caller. Any
+         *  job not in [uploadTempFiles]/[downloadTempFiles] (e.g. a plain remote-to-remote action
+         *  like create-dir/rename) is forwarded unchanged. */
+        private fun handleJobEvent(json: String) {
+            val obj = runCatching { JSONObject(json) }.getOrNull()
+            val type = obj?.optString("type")
+            val jobId = obj?.optInt("id") ?: -1
+
+            if (type == "done" || type == "error") {
+                uploadTempFiles.remove(jobId)?.let { tempFile ->
+                    tempFile.delete()
+                }
+                downloadTempFiles.remove(jobId)?.let { (tempFile, suggestedName) ->
+                    if (type == "done") {
+                        val savedUri = saveDownloadToMediaStore(tempFile, suggestedName)
+                        val augmented = JSONObject(json).put("savedUri", savedUri)
+                        runCatching { callback?.onJobEvent(augmented.toString()) }
+                            .onFailure { Log.w(TAG, "onJobEvent callback failed: ${it.message}") }
+                        return
+                    } else {
+                        tempFile.delete()
+                    }
+                }
+            }
+            runCatching { callback?.onJobEvent(json) }
+                .onFailure { Log.w(TAG, "onJobEvent callback failed: ${it.message}") }
+        }
+
+        /** Moves a finished download from its private temp path into the shared Downloads
+         *  collection (Android 10+ — no storage permission needed to create a NEW entry there,
+         *  unlike reading/modifying other apps' entries). Returns the resulting content:// Uri, or
+         *  null on failure OR on Android <10, where MediaStore.Downloads doesn't exist and this app
+         *  has no broad storage permission to write the real shared Downloads folder directly —
+         *  the finished file is left at [tempFile] (this process's own external-files directory)
+         *  in that case; the caller should tell the user it landed in the plugin's own storage
+         *  rather than the system Downloads folder. */
+        private fun saveDownloadToMediaStore(tempFile: File, suggestedName: String): String? {
+            if (Build.VERSION.SDK_INT < 29) return null
+            return try {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, suggestedName)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: return null
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    tempFile.inputStream().use { it.copyTo(out) }
+                } ?: return null
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+                tempFile.delete()
+                uri.toString()
+            } catch (e: Exception) {
+                Log.w(TAG, "saveDownloadToMediaStore($suggestedName) failed: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+        }
+
+        override fun readRemoteDir(path: String, showHidden: Boolean) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.ftReadRemoteDir(sessionId, path, showHidden)
+        }
+
+        override fun uploadFile(jobId: Int, contentUri: String, remotePath: String, includeHidden: Boolean) {
+            if (!isCallerAuthorized()) return
+            // Runs on its own thread, not the poll thread — copying a large file must not stall
+            // event draining for the rest of this session's jobs.
+            Thread({
+                val tempFile = File(filesDir, "ft_upload_$jobId")
+                try {
+                    val uri = Uri.parse(contentUri)
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        tempFile.outputStream().use { output -> input.copyTo(output) }
+                    } ?: throw java.io.IOException("openInputStream returned null for $contentUri")
+                    uploadTempFiles[jobId] = tempFile
+                    val started = NativeBridge.ftSendFiles(sessionId, jobId, tempFile.absolutePath, remotePath, true, includeHidden)
+                    if (!started) {
+                        uploadTempFiles.remove(jobId)
+                        tempFile.delete()
+                        reportLocalError(jobId, "Failed to start upload")
+                    }
+                } catch (e: Exception) {
+                    uploadTempFiles.remove(jobId)
+                    tempFile.delete()
+                    reportLocalError(jobId, "Couldn't read the picked file: ${e.message}")
+                }
+            }, "RustDesk-ft-upload-$jobId").apply { isDaemon = true; start() }
+        }
+
+        override fun downloadFile(jobId: Int, remotePath: String, suggestedFileName: String, includeHidden: Boolean) {
+            if (!isCallerAuthorized()) return
+            val tempFile = File(filesDir, "ft_download_$jobId")
+            downloadTempFiles[jobId] = tempFile to suggestedFileName
+            val started = NativeBridge.ftSendFiles(sessionId, jobId, tempFile.absolutePath, remotePath, false, includeHidden)
+            if (!started) {
+                downloadTempFiles.remove(jobId)
+                reportLocalError(jobId, "Failed to start download")
+            }
+        }
+
+        /** Synthesizes an onJobEvent "error" for a failure that happens entirely on this side
+         *  (local copy-in for an upload, before the native transfer even starts) — same channel a
+         *  native-side transfer failure reports through, so the caller doesn't need two error
+         *  paths. file_num=0 since this fails before any per-file accounting exists yet. */
+        private fun reportLocalError(jobId: Int, message: String) {
+            val json = JSONObject().apply {
+                put("type", "error")
+                put("id", jobId)
+                put("file_num", 0)
+                put("err", message)
+            }.toString()
+            runCatching { callback?.onJobEvent(json) }
+                .onFailure { Log.w(TAG, "onJobEvent callback failed: ${it.message}") }
+        }
+
+        override fun answerOverrideConfirm(jobId: Int, fileNum: Int, overwrite: Boolean, remember: Boolean, isUpload: Boolean) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.ftAnswerOverrideConfirm(sessionId, jobId, fileNum, overwrite, remember, isUpload)
+        }
+
+        override fun cancelJob(jobId: Int) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.ftCancelJob(sessionId, jobId)
+            uploadTempFiles.remove(jobId)?.delete()
+            downloadTempFiles.remove(jobId)?.first?.delete()
+        }
+
+        override fun destroy() {
+            if (!isCallerAuthorized()) return
+            destroyInternal()
+        }
+
+        /** See RustDeskSessionImpl.destroyInternal's doc for why this has no [isCallerAuthorized]
+         *  check — the same split applies here. */
+        fun destroyInternal() {
+            running = false
+            pollThread.interrupt()
+            uploadTempFiles.values.forEach { it.delete() }
+            uploadTempFiles.clear()
+            downloadTempFiles.values.forEach { it.first.delete() }
+            downloadTempFiles.clear()
+            NativeBridge.disconnect(sessionId)
+            openFileTransferSessions.remove(this)
             demoteFromForegroundIfIdle()
         }
     }
