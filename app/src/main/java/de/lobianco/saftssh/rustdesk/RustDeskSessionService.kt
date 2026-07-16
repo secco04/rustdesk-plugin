@@ -275,6 +275,7 @@ class RustDeskSessionService : Service() {
                 while (running) {
                     val text = NativeBridge.pollRemoteClipboardText()
                     if (text != null) {
+                        Log.i(TAG, "pumpClipboard($sessionId): got ${text.length} chars from peer, writing to local clipboard")
                         lastClipboardSetByUs = text
                         clipboardManager?.setPrimaryClip(ClipData.newPlainText("RustDesk", text))
                     }
