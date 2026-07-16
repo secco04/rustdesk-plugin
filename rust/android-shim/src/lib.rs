@@ -611,3 +611,423 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_disconnect
         }
     })
 }
+
+// ---------------------------------------------------------------------------------------------
+// File transfer (bidirectional Android <-> remote host).
+//
+// File transfer needs a SECOND, fully separate session from the control/video one: RustDesk keys
+// sessions by (peer_id, ConnType) and the HOST silently drops FileAction messages on any
+// connection that didn't identify itself as ConnType::FILE_TRANSFER at login. So this uses its
+// own SessionID (fresh Uuid) and calls session_add_sync with is_file_transfer = true.
+//
+// All the actual protocol/algorithm already exists in flutter_ffi + the blanket
+// `impl FileManager for Session<T>` — these exports are thin wrappers. Results (dir listings, job
+// progress/done/error, overwrite prompts) come back asynchronously through the poll caches added
+// in librustdesk::flutter (ft_take_*), since our headless session never sets an event_stream.
+// Poll them the same clear-on-read way as pollCursor/pollRemoteClipboardText.
+// ---------------------------------------------------------------------------------------------
+
+/// Opens a dedicated FILE-TRANSFER session to `id` (Remote ID) + `password`. Returns the new
+/// session id as a UUID string on success, or "ERR:<message>" on failure. This is a SEPARATE
+/// session from `connect()`'s control/video session (different ConnType), so a device can have
+/// both open to the same peer at once; disconnect it with the normal `disconnect(sessionId)`.
+///
+/// Unlike `connect()`, this deliberately does NOT poke codec-preference or show-remote-cursor —
+/// RustDesk sends no video/cursor on a file-transfer connection (get_option_message returns None
+/// for ConnType::FILE_TRANSFER), so those would be meaningless here.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connectFileTransfer<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    id: JString<'local>,
+    password: JString<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let id: String = env.get_string(&id).map(|s| s.into()).unwrap_or_default();
+        let password: String = env
+            .get_string(&password)
+            .map(|s| s.into())
+            .unwrap_or_default();
+
+        let result = if id.is_empty() {
+            "ERR:Remote ID must not be empty".to_string()
+        } else {
+            let session_id = Uuid::new_v4();
+            let add_result = librustdesk::flutter_ffi::session_add_sync(
+                session_id,
+                id.clone(),
+                true,  // is_file_transfer -> ConnType::FILE_TRANSFER
+                false, // is_view_camera
+                false, // is_port_forward
+                false, // is_rdp
+                false, // is_terminal
+                String::new(), // switch_uuid
+                false, // force_relay
+                password,
+                false, // is_shared_password
+                None,  // conn_token
+            );
+            if !add_result.0.is_empty() {
+                format!("ERR:{}", add_result.0)
+            } else {
+                match librustdesk::flutter::session_start_headless(&session_id, &id) {
+                    Ok(()) => session_id.to_string(),
+                    Err(e) => format!("ERR:{}", e),
+                }
+            }
+        };
+        env.new_string(result)
+            .expect("Couldn't create Java string")
+            .into_raw()
+    })
+}
+
+/// Requests a remote directory listing (fire-and-forget). The result is delivered asynchronously —
+/// poll `ftPollDirListing(sessionId)` for it. `showHidden` includes dotfiles/hidden entries.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftReadRemoteDir<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    path: JString<'local>,
+    show_hidden: jboolean,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        let path: String = env.get_string(&path).map(|s| s.into()).unwrap_or_default();
+        librustdesk::flutter_ffi::session_read_remote_dir(session_id, path, show_hidden == JNI_TRUE);
+    })
+}
+
+/// SYNCHRONOUS local (Android-side) directory listing — reads the real filesystem directly, no
+/// session/network involved (hence no session id param). Returns a JSON string, or null on error
+/// (path missing/unreadable). JSON shape: `{"id":<int>,"path":"<str>","entries":[{"entry_type":
+/// <int>,"name":"<str>","size":<u64>,"modified_time":<u64>}]}` (same shape RustDesk's own
+/// make_fd_to_json emits; entry_type is the FileType enum int: 0=Dir,2=DirLink,3=DirDrive,4=File,
+/// 5=FileLink). Note this listing has NO "is_local"/"only_count"/"is_hidden" fields — it's the
+/// upstream sync-local format, distinct from the async ftPollDirListing JSON shape.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftReadLocalDir<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
+    show_hidden: jboolean,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let path: String = env.get_string(&path).map(|s| s.into()).unwrap_or_default();
+        // session_read_local_dir_sync ignores its session id (pure fs access); pass a nil Uuid.
+        let json = librustdesk::flutter_ffi::session_read_local_dir_sync(
+            Uuid::nil(),
+            path,
+            show_hidden == JNI_TRUE,
+        );
+        if json.is_empty() {
+            return std::ptr::null_mut();
+        }
+        env.new_string(json)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Drains one pending remote directory-listing result for this session (FIFO clear-on-read), or
+/// null if none pending. JSON shape: `{"id":<int>,"path":"<str>","is_local":<bool>,"only_count":
+/// <bool>,"entries":[{"entry_type":<int>,"name":"<str>","is_hidden":<bool>,"size":<u64>,
+/// "modified_time":<u64>}]}`. `entry_type` is the FileType enum int (0=Dir,2=DirLink,3=DirDrive,
+/// 4=File,5=FileLink). `is_local`/`only_count` are usually false/false for a remote listing; a
+/// `only_count:true` entry is a local read-job preview count, not a browsable listing.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftPollDirListing<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return std::ptr::null_mut();
+        };
+        match librustdesk::flutter::ft_take_dir_listing(&session_id) {
+            Some(json) => env
+                .new_string(json)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Drains one pending job-status event for this session (FIFO clear-on-read), or null if none.
+/// JSON is one of:
+///   `{"type":"progress","id":<int>,"file_num":<int>,"speed":<f64>,"finished_size":<f64>}`
+///   `{"type":"done","id":<int>,"file_num":<int>}`
+///   `{"type":"error","id":<int>,"file_num":<int>,"err":"<str>"}`
+/// `id` is the job id passed to `ftSendFiles`. A multi-file job emits per-file done/error plus
+/// periodic progress ticks. Poll this on a timer while any job is active.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftPollJobEvent<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return std::ptr::null_mut();
+        };
+        match librustdesk::flutter::ft_take_job_event(&session_id) {
+            Some(json) => env
+                .new_string(json)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Takes the pending overwrite/resume-confirm prompt for this session (clear-on-read), or null if
+/// none pending. The job STALLS until answered via `ftAnswerOverrideConfirm`. JSON shape:
+/// `{"id":<int>,"file_num":<int>,"to":"<str>","is_upload":<bool>,"is_identical":<bool>}` — `id` is
+/// the job id, `to` the destination path already present, `is_identical` true when the existing
+/// file looks byte-identical (safe to skip). Only one prompt is outstanding at a time.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftPollOverrideConfirm<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return std::ptr::null_mut();
+        };
+        match librustdesk::flutter::ft_take_override_confirm(&session_id) {
+            Some(json) => env
+                .new_string(json)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Answers a pending overwrite prompt (see `ftPollOverrideConfirm`). `overwrite = true` writes over
+/// the existing file (resume-from-start), `false` skips this file. `remember` applies the same
+/// choice to the rest of the files in the job without prompting again. `jobId`/`fileNum`/`isUpload`
+/// come straight from the prompt's JSON (`id`/`file_num`/`is_upload`).
+///
+/// NOTE: deviates from the originally-sketched `(jobId, skip, offsetBlock)` shape — the real
+/// underlying call is `session_set_confirm_override_file(session, act_id, file_num, need_override,
+/// remember, is_upload)`. There is no caller-supplied offset in this code path (upstream always
+/// sends OffsetBlk(0) when overwriting), and `file_num`/`is_upload` are required, so this exposes
+/// the real parameters instead. `skip` == `!overwrite`.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftAnswerOverrideConfirm<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    job_id: jint,
+    file_num: jint,
+    overwrite: jboolean,
+    remember: jboolean,
+    is_upload: jboolean,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        librustdesk::flutter_ffi::session_set_confirm_override_file(
+            session_id,
+            job_id,
+            file_num,
+            overwrite == JNI_TRUE,
+            remember == JNI_TRUE,
+            is_upload == JNI_TRUE,
+        );
+    })
+}
+
+/// Starts a transfer job. `jobId` is a caller-chosen i32 that ties later job events back to this
+/// call (keep it unique per active job). Uploads read `localPath` and write it to `remotePath` on
+/// the host; downloads read `remotePath` and write it to `localPath`. BOTH directions use real
+/// filesystem paths — RustDesk's fs layer has no SAF/URI support, so the Kotlin side must stage a
+/// SAF-picked upload into app-private storage first, and copy a finished download out of
+/// app-private storage into MediaStore afterward. `includeHidden` includes hidden files when the
+/// path is a directory. Returns true if the job was dispatched (valid session id + inputs), false
+/// otherwise. Job outcome/progress arrives via `ftPollJobEvent`.
+///
+/// (Uses `session_send_files`, which both creates the job AND sends the network start message —
+/// `session_add_job` only queues a "waiting" job without sending, so it is NOT used here.)
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftSendFiles<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    job_id: jint,
+    local_path: JString<'local>,
+    remote_path: JString<'local>,
+    is_upload: jboolean,
+    include_hidden: jboolean,
+) -> jboolean {
+    guard(JNI_FALSE, move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return JNI_FALSE;
+        };
+        let local_path: String = env
+            .get_string(&local_path)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let remote_path: String = env
+            .get_string(&remote_path)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        // is_remote flips the source/destination roles inside io_loop:
+        //   upload  (is_remote=false): read local `path`, send to remote `to`.
+        //   download (is_remote=true): write local `to`, read from remote `path`.
+        let is_upload = is_upload == JNI_TRUE;
+        let (path, to, is_remote) = if is_upload {
+            (local_path, remote_path, false)
+        } else {
+            (remote_path, local_path, true)
+        };
+        librustdesk::flutter_ffi::session_send_files(
+            session_id,
+            job_id,
+            path,
+            to,
+            0, // file_num: start from the first file
+            include_hidden == JNI_TRUE,
+            is_remote,
+            false, // _is_dir (unused by the underlying call)
+        );
+        JNI_TRUE
+    })
+}
+
+/// Cancels the job with id `jobId` (upload or download). Safe to call for an already-finished or
+/// unknown job (no-op).
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftCancelJob<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    job_id: jint,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        librustdesk::flutter_ffi::session_cancel_job(session_id, job_id);
+    })
+}
+
+/// Creates a directory named `path` on the remote host (fire-and-forget; `path` is the full remote
+/// path to create).
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftCreateRemoteDir<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    job_id: jint,
+    path: JString<'local>,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        let path: String = env.get_string(&path).map(|s| s.into()).unwrap_or_default();
+        // is_remote = true -> create on the host.
+        librustdesk::flutter_ffi::session_create_dir(session_id, job_id, path, true);
+    })
+}
+
+/// Removes a single remote file (`isDir = false`) or empty remote directory (`isDir = true`) at
+/// `path`. `jobId` ties any resulting job event back to this call. NOTE: this only handles a
+/// single file / empty dir — recursive directory deletion (read-all-files then per-file remove) is
+/// intentionally out of scope for this pass.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftRemoveRemoteFile<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    job_id: jint,
+    path: JString<'local>,
+    is_dir: jboolean,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        let path: String = env.get_string(&path).map(|s| s.into()).unwrap_or_default();
+        if is_dir == JNI_TRUE {
+            // Remove an empty remote directory. is_remote = true.
+            librustdesk::flutter_ffi::session_remove_all_empty_dirs(session_id, job_id, path, true);
+        } else {
+            // Remove a single remote file. file_num 0, is_remote = true.
+            librustdesk::flutter_ffi::session_remove_file(session_id, job_id, path, 0, true);
+        }
+    })
+}
+
+/// Renames/moves a remote entry at `path` to `newName` (a name, not a full path — RustDesk joins
+/// it against the parent). Fire-and-forget.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftRenameRemoteFile<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    job_id: jint,
+    path: JString<'local>,
+    new_name: JString<'local>,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        let path: String = env.get_string(&path).map(|s| s.into()).unwrap_or_default();
+        let new_name: String = env
+            .get_string(&new_name)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        librustdesk::flutter_ffi::session_rename_file(session_id, job_id, path, new_name, true);
+    })
+}

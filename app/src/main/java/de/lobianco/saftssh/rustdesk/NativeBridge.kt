@@ -102,4 +102,85 @@ object NativeBridge {
     /** Switches which single display (0-based) this session captures/views — fire-and-forget; the
      *  new display's size/first frame arrive through the normal getDisplaySize/getFrame polling. */
     external fun switchDisplay(sessionId: String, display: Int)
+
+    // ---------------------------------------------------------------------------------------------
+    // File transfer (bidirectional Android <-> remote host).
+    //
+    // File transfer runs on its OWN session, SEPARATE from [connect]'s control/video session (the
+    // host drops file actions on a non-file-transfer connection). Open it with [connectFileTransfer]
+    // and close it with the normal [disconnect]. Everything is asynchronous: browse/transfer calls
+    // are fire-and-forget, and results come back through the ft*Poll* getters (clear-on-read, same
+    // contract as [pollCursor]/[pollRemoteClipboardText]) — poll them on a timer.
+    // ---------------------------------------------------------------------------------------------
+
+    /** Opens a dedicated FILE-TRANSFER session to [id] + [password]. Returns the new session id
+     *  (UUID string) on success, or "ERR:<message>" on failure. Separate from [connect]'s session,
+     *  so both can be open to the same peer at once; close it with [disconnect]. */
+    external fun connectFileTransfer(id: String, password: String): String
+
+    /** Requests a remote directory listing (fire-and-forget). Poll [ftPollDirListing] for the
+     *  result. [showHidden] includes hidden/dot entries. */
+    external fun ftReadRemoteDir(sessionId: String, path: String, showHidden: Boolean)
+
+    /** SYNCHRONOUS local (Android-side) filesystem listing — no session/network, so no session id.
+     *  Returns JSON directly, or null on error (path missing/unreadable). Shape:
+     *  `{"id":Int,"path":String,"entries":[{"entry_type":Int,"name":String,"size":Long,
+     *  "modified_time":Long}]}`. `entry_type` is the FileType enum int: 0=Dir, 2=DirLink,
+     *  3=DirDrive, 4=File, 5=FileLink. This is the upstream sync-local shape and (unlike
+     *  [ftPollDirListing]) has no is_local/only_count/is_hidden fields. */
+    external fun ftReadLocalDir(path: String, showHidden: Boolean): String?
+
+    /** Drains one pending remote directory-listing result for this session (FIFO clear-on-read), or
+     *  null if none pending. JSON shape: `{"id":Int,"path":String,"is_local":Boolean,
+     *  "only_count":Boolean,"entries":[{"entry_type":Int,"name":String,"is_hidden":Boolean,
+     *  "size":Long,"modified_time":Long}]}`. `entry_type` is the FileType enum int (0=Dir,
+     *  2=DirLink, 3=DirDrive, 4=File, 5=FileLink). A `only_count:true` entry is a local read-job
+     *  preview count, not a browsable listing. */
+    external fun ftPollDirListing(sessionId: String): String?
+
+    /** Drains one pending job-status event for this session (FIFO clear-on-read), or null if none.
+     *  JSON is one of:
+     *   `{"type":"progress","id":Int,"file_num":Int,"speed":Double,"finished_size":Double}`
+     *   `{"type":"done","id":Int,"file_num":Int}`
+     *   `{"type":"error","id":Int,"file_num":Int,"err":String}`
+     *  `id` is the job id passed to [ftSendFiles]. Poll on a timer while any job is active. */
+    external fun ftPollJobEvent(sessionId: String): String?
+
+    /** Takes the pending overwrite/resume-confirm prompt for this session (clear-on-read), or null
+     *  if none. The job STALLS until answered via [ftAnswerOverrideConfirm]. JSON shape:
+     *  `{"id":Int,"file_num":Int,"to":String,"is_upload":Boolean,"is_identical":Boolean}` — `id` is
+     *  the job id, `to` the destination path, `is_identical` true when the existing file looks
+     *  byte-identical (safe to skip). At most one prompt is outstanding at a time. */
+    external fun ftPollOverrideConfirm(sessionId: String): String?
+
+    /** Answers a pending overwrite prompt (see [ftPollOverrideConfirm]). [overwrite] = true writes
+     *  over the existing file, false skips it. [remember] applies the same choice to the rest of
+     *  the job's files without re-prompting. [jobId]/[fileNum]/[isUpload] come from the prompt JSON
+     *  (`id`/`file_num`/`is_upload`). */
+    external fun ftAnswerOverrideConfirm(sessionId: String, jobId: Int, fileNum: Int, overwrite: Boolean, remember: Boolean, isUpload: Boolean)
+
+    /** Starts a transfer job. [jobId] is a caller-chosen unique int that ties later [ftPollJobEvent]
+     *  events back to this call. Upload ([isUpload] = true): reads [localPath], writes to
+     *  [remotePath] on the host. Download ([isUpload] = false): reads [remotePath], writes to
+     *  [localPath]. BOTH paths are REAL filesystem paths — RustDesk has no SAF/URI support, so stage
+     *  a SAF-picked upload into app-private storage first, and copy a finished download out of
+     *  app-private storage into MediaStore afterward. [includeHidden] applies when the path is a
+     *  directory. Returns true if the job was dispatched. Outcome/progress via [ftPollJobEvent]. */
+    external fun ftSendFiles(sessionId: String, jobId: Int, localPath: String, remotePath: String, isUpload: Boolean, includeHidden: Boolean): Boolean
+
+    /** Cancels the job [jobId] (upload or download). No-op for an unknown/finished job. */
+    external fun ftCancelJob(sessionId: String, jobId: Int)
+
+    /** Creates a directory at the full remote [path] on the host (fire-and-forget). [jobId] ties
+     *  any resulting job event back to this call. */
+    external fun ftCreateRemoteDir(sessionId: String, jobId: Int, path: String)
+
+    /** Removes a single remote file ([isDir] = false) or empty remote directory ([isDir] = true) at
+     *  [path]. Recursive directory deletion is intentionally out of scope. [jobId] ties any
+     *  resulting job event back to this call. */
+    external fun ftRemoveRemoteFile(sessionId: String, jobId: Int, path: String, isDir: Boolean)
+
+    /** Renames a remote entry at [path] to [newName] (a bare name, not a full path). [jobId] ties
+     *  any resulting job event back to this call. Fire-and-forget. */
+    external fun ftRenameRemoteFile(sessionId: String, jobId: Int, path: String, newName: String)
 }
