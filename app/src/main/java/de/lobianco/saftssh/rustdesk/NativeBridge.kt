@@ -70,6 +70,13 @@ object NativeBridge {
      *  frame is ready yet (just poll again; this is normal, not an error). */
     external fun getFrame(sessionId: String, display: Int): ByteArray?
 
+    /** The host's real mouse cursor shape (I-beam, resize arrows, …), or null if it hasn't changed
+     *  since the last call (clear-on-read — poll alongside [getFrame] and only rebuild the Bitmap
+     *  on a non-null result). Layout: 4 little-endian ints — width, height, hotx, hoty — followed
+     *  by width * height * 4 bytes of RGBA pixels, matching
+     *  [android.graphics.Bitmap.Config.ARGB_8888]'s in-memory layout like [getFrame]'s. */
+    external fun pollCursor(sessionId: String): ByteArray?
+
     external fun disconnect(sessionId: String)
 
     /** Mouse input. [mouseType] is "" (plain move), "down", "up", or "wheel"; [buttons] is "" or

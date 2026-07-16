@@ -174,6 +174,32 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connect<'l
                     "codec-preference".to_string(),
                     "vp9".to_string(),
                 );
+                // Negotiate the host's real mouse cursor ON, before session_start_headless builds
+                // the login request. client.rs's login builder only sets
+                // `msg.show_remote_cursor = Yes` when `get_toggle_option("show-remote-cursor")`
+                // is true — we're not view_only and the default is false, so the host would never
+                // send CursorData/CursorId at all and pollCursor would stay empty forever.
+                //
+                // NOTE this is deliberately NOT session_peer_option like codec-preference above:
+                // session_peer_option -> set_option only inserts into PeerConfig's `options`
+                // string map, whereas get_toggle_option("show-remote-cursor") reads the separate
+                // typed `config.show_remote_cursor.v` bool — so a peer_option here would be
+                // silently ignored. session_toggle_option -> LoginConfigHandler::toggle_option is
+                // the only writer of that field.
+                //
+                // toggle_option TOGGLES (`v = !v`) and persists to the peer's PeerConfig on disk,
+                // so a blind toggle would turn the cursor back OFF on the next connect to the
+                // same peer. Read first and only flip when actually off, making this idempotent.
+                if librustdesk::flutter_ffi::session_get_toggle_option(
+                    session_id,
+                    "show-remote-cursor".to_string(),
+                ) != Some(true)
+                {
+                    librustdesk::flutter_ffi::session_toggle_option(
+                        session_id,
+                        "show-remote-cursor".to_string(),
+                    );
+                }
                 match librustdesk::flutter::session_start_headless(&session_id, &id) {
                     Ok(()) => session_id.to_string(),
                     Err(e) => format!("ERR:{}", e),
@@ -367,6 +393,44 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_getFrame<'
         };
         librustdesk::flutter::session_next_rgba(session_id, display);
         result.into_raw()
+    })
+}
+
+/// Host cursor shape. Returns the CURRENT remote cursor, but only if it changed since the last
+/// call — null otherwise (clear-on-read polling, same contract as `pollRemoteClipboardText` and
+/// `getFrame`), so the caller can poll this on its video-pump loop and only rebuild its Bitmap on
+/// a non-null result. Also null before the host has sent any cursor, and when a `CursorId`
+/// referenced a shape we don't have cached (evicted or never received) rather than returning
+/// garbage.
+///
+/// Layout of the returned array: 4 little-endian i32s — `width`, `height`, `hotx`, `hoty` (16
+/// bytes) — followed by exactly `width * height * 4` bytes of RGBA pixel data. RGBA matches
+/// Android's `Bitmap.Config.ARGB_8888` in-memory byte order, so no swizzle is needed.
+///
+/// `session_id` is validated as a UUID for symmetry with the other exports, but the underlying
+/// cursor cache in `librustdesk::flutter` is GLOBAL, not per-session (see `take_headless_cursor`'s
+/// doc for why) — with one active session at a time this is equivalent.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollCursor<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jbyteArray {
+    guard(std::ptr::null_mut(), move || {
+        let session_id_str: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        if Uuid::parse_str(&session_id_str).is_err() {
+            return std::ptr::null_mut();
+        }
+        match librustdesk::flutter::take_headless_cursor() {
+            Some(bytes) => env
+                .byte_array_from_slice(&bytes)
+                .map(|r| r.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            None => std::ptr::null_mut(),
+        }
     })
 }
 
