@@ -756,6 +756,7 @@ class RustDeskSessionService : Service() {
 
                     NativeBridge.ftPollDirListing(sessionId)?.let { json ->
                         gotAny = true
+                        Log.i(TAG, "ftPollDirListing($sessionId): got a listing (${json.length} chars)")
                         runCatching { callback?.onDirListing(json) }
                             .onFailure { Log.w(TAG, "onDirListing callback failed: ${it.message}") }
                     }
@@ -853,6 +854,7 @@ class RustDeskSessionService : Service() {
 
         override fun readRemoteDir(path: String, showHidden: Boolean) {
             if (!isCallerAuthorized()) return
+            Log.i(TAG, "readRemoteDir($sessionId, \"$path\")")
             NativeBridge.ftReadRemoteDir(sessionId, path, showHidden)
         }
 
