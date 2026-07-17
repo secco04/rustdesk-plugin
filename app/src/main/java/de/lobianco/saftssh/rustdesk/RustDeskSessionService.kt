@@ -760,6 +760,11 @@ class RustDeskSessionService : Service() {
             NativeBridge.inputString(sessionId, value.orEmpty())
         }
 
+        override fun ctrlAltDel() {
+            if (!isCallerAuthorized()) return
+            NativeBridge.ctrlAltDel(sessionId)
+        }
+
         override fun isAlive(): Boolean {
             if (!isCallerAuthorized()) return false
             return NativeBridge.isAlive(sessionId)

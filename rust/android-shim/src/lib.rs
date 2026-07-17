@@ -1398,3 +1398,29 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connectVie
             .into_raw()
     })
 }
+
+/// Sends RustDesk's own dedicated Ctrl+Alt+Del control-key event (`ControlKey::CtrlAltDel`, a
+/// single `KeyEvent`, NOT three separate down/up presses of VK_CONTROL/VK_MENU/VK_DELETE) — the
+/// only way to actually trigger a Windows peer's secure-attention-sequence (login/lock screen/Task
+/// Manager). Windows blocks synthetic Ctrl+Alt+Delete key INJECTION for security (it's the whole
+/// point of SAS), which is why sending it as three plain key events (what the special-key bar used
+/// to do) silently did nothing on a real Windows host — confirmed by reading
+/// `keyboard::client::event_ctrl_alt_del`: on a Windows peer it builds a single event carrying
+/// `ControlKey::CtrlAltDel`, which the host's own privileged RustDesk service (not a synthetic
+/// input driver) recognizes and turns into a real SAS. Non-Windows peers get a normal Ctrl+Alt+Del
+/// combo instead (that OS has no such restriction). Already exists fully upstream
+/// (`flutter_ffi::session_ctrl_alt_del` -> `Session::ctrl_alt_del` -> `send_key_event`) — this is a
+/// direct wrapper, not a new native code path.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ctrlAltDel<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) {
+    guard((), move || {
+        let session_id: String = env.get_string(&session_id).map(|s| s.into()).unwrap_or_default();
+        if let Ok(session_id) = Uuid::parse_str(&session_id) {
+            librustdesk::flutter_ffi::session_ctrl_alt_del(session_id);
+        }
+    })
+}

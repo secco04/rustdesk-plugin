@@ -31,6 +31,15 @@ interface IRustDeskSession {
     /** Types a plain text string (e.g. from a soft-keyboard/IME commitText callback). */
     oneway void inputString(String value);
 
+    /** Sends RustDesk's own dedicated Ctrl+Alt+Del control-key event — NOT three separate down/up
+     *  presses of VK_CONTROL/VK_MENU/VK_DELETE (that's what NativeBridge.inputKey would do, and a
+     *  real Windows peer silently ignores it: Windows blocks synthetic Ctrl+Alt+Delete key
+     *  INJECTION for security, the whole point of the secure-attention-sequence). This is the only
+     *  way to actually trigger a Windows peer's SAS (login/lock screen/Task Manager). See
+     *  NativeBridge.ctrlAltDel's doc for why. oneway: fire-and-forget, same as the other input
+     *  methods on this interface. */
+    oneway void ctrlAltDel();
+
     /** Pinch-zoom transform applied on top of the plugin's base letterbox fit, mirroring
      *  IRemoteDesktopSession.setZoom / VncClient.blitToSurface: [scale] is relative to the base fit
      *  (1.0 = no zoom), [panX]/[panY] are Surface-local pixel offsets. The caller (RustDeskScreen)

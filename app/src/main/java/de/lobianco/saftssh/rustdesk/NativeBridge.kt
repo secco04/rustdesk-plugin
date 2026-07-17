@@ -96,6 +96,12 @@ object NativeBridge {
      *  side synthesizes the needed key events per character. */
     external fun inputString(sessionId: String, value: String)
 
+    /** Sends RustDesk's own dedicated Ctrl+Alt+Del control-key event — NOT three separate
+     *  down/up presses of [inputKey], which a real Windows peer silently ignores (Windows blocks
+     *  synthetic Ctrl+Alt+Delete key injection for security). Non-Windows peers get a normal
+     *  Ctrl+Alt+Del key combo instead. */
+    external fun ctrlAltDel(sessionId: String)
+
     /** Number of displays (monitors) the peer reported, or 0 if not known yet. */
     external fun getDisplayCount(sessionId: String): Int
 
