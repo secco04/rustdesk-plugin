@@ -78,6 +78,13 @@ interface IRustDeskSession {
      *  oneway: pure render state, same fire-and-forget reasoning as setZoom. */
     oneway void setCursorOptions(String mode, float syntheticScale);
 
+    /** Mutes/unmutes incoming audio — wraps RustDesk's own "disable-audio" peer option. oneway,
+     *  same fire-and-forget reasoning as setZoom/setCursorOptions. */
+    oneway void setAudioMuted(boolean muted);
+
+    /** Current mute state. Quick synchronous native field read, same cost class as isAlive(). */
+    boolean isAudioMuted();
+
     /** Tears down the connection. oneway: native teardown can block for an unbounded time (same
      *  reasoning as IRemoteDesktopSession.destroy() in the VNC/RDP/Proxmox VE plugin). */
     oneway void destroy();

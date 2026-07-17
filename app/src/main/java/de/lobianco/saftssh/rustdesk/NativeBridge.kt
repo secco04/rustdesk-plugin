@@ -103,6 +103,26 @@ object NativeBridge {
      *  new display's size/first frame arrive through the normal getDisplaySize/getFrame polling. */
     external fun switchDisplay(sessionId: String, display: Int)
 
+    // ── Audio playback ──────────────────────────────────────────────────────────────────────
+
+    /** [sampleRate, channels], or null if the peer's audio format hasn't (re)negotiated since the
+     *  last call — clear-on-change polling. Rebuild the [android.media.AudioTrack] on a non-null
+     *  result (the format CAN change mid-session, e.g. the peer switching audio devices). */
+    external fun pollAudioFormat(sessionId: String): IntArray?
+
+    /** Drains up to [maxSamples] interleaved f32 PCM samples decoded so far (FIFO), or an empty
+     *  (not null) array if none are pending yet — unlike the other poll functions, "nothing new"
+     *  is the normal, frequent case here (audio arrives in small ~20ms frames), so there's no
+     *  null/non-null distinction worth branching on every poll. */
+    external fun pollAudioPcm(sessionId: String, maxSamples: Int): FloatArray?
+
+    /** Mutes/unmutes incoming audio — wraps RustDesk's own "disable-audio" peer option. Idempotent
+     *  on the native side (reads the current state first, only flips if it doesn't already match),
+     *  so calling this redundantly is harmless. */
+    external fun setAudioMuted(sessionId: String, muted: Boolean)
+
+    external fun isAudioMuted(sessionId: String): Boolean
+
     // ---------------------------------------------------------------------------------------------
     // File transfer (bidirectional Android <-> remote host).
     //

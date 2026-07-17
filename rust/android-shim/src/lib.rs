@@ -5,7 +5,7 @@
 // with no Dart isolate).
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jintArray, jstring, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jbyteArray, jfloatArray, jint, jintArray, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use uuid::Uuid;
@@ -430,6 +430,132 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollCursor
                 .map(|r| r.into_raw())
                 .unwrap_or(std::ptr::null_mut()),
             None => std::ptr::null_mut(),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audio (plans/soft-frolicking-thimble.md, "Audio" round): playback. `AudioHandler` (client.rs)
+// decodes each incoming frame on its own dedicated thread — already headless-safe, no push_event
+// involved (see that file's comments) — and pushes format/PCM into `librustdesk::flutter`'s
+// global poll cache (same "global rather than per-session" tradeoff as the cursor/clipboard
+// caches). These two exports drain it for the Kotlin side to feed an `android.media.AudioTrack`.
+// ---------------------------------------------------------------------------------------------
+
+/// [sampleRate, channels], or null if the format hasn't (re)negotiated since the last call —
+/// clear-on-change polling, same contract as `pollCursor`. The caller should (re)build its
+/// `AudioTrack` on a non-null result.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollAudioFormat<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jintArray {
+    guard(std::ptr::null_mut(), move || {
+        let session_id_str: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        if Uuid::parse_str(&session_id_str).is_err() {
+            return std::ptr::null_mut();
+        }
+        let Some((sample_rate, channels)) = librustdesk::flutter::take_headless_audio_format() else {
+            return std::ptr::null_mut();
+        };
+        let arr = match env.new_int_array(2) {
+            Ok(a) => a,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        if env
+            .set_int_array_region(&arr, 0, &[sample_rate as jint, channels as jint])
+            .is_err()
+        {
+            return std::ptr::null_mut();
+        }
+        arr.into_raw()
+    })
+}
+
+/// Drains up to `maxSamples` interleaved f32 PCM samples decoded so far (FIFO order), or an empty
+/// (not null) array if none are pending yet — unlike the other poll exports, "nothing new" is a
+/// perfectly normal, frequent state here (audio arrives in small frequent frames), so it's not
+/// worth a null/non-null distinction the caller would have to branch on every ~20ms.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollAudioPcm<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    max_samples: jint,
+) -> jfloatArray {
+    guard(std::ptr::null_mut(), move || {
+        let session_id_str: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        if Uuid::parse_str(&session_id_str).is_err() {
+            return std::ptr::null_mut();
+        }
+        let samples = librustdesk::flutter::take_headless_audio_pcm(max_samples.max(0) as usize);
+        let arr = match env.new_float_array(samples.len() as i32) {
+            Ok(a) => a,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        if !samples.is_empty() && env.set_float_array_region(&arr, 0, &samples).is_err() {
+            return std::ptr::null_mut();
+        }
+        arr.into_raw()
+    })
+}
+
+/// Mute toggle — wraps `session_toggle_option`/`session_get_toggle_option("disable-audio")`
+/// idempotently (read first, only flip if the current state doesn't already match `muted`), same
+/// pattern `setCursorOptions`'s `show-remote-cursor` handling established: `toggle_option` really
+/// does toggle-and-persist, so a blind call on every UI open would silently flip a user's earlier
+/// choice back on the next connect to the same peer.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_setAudioMuted<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    muted: jboolean,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        let want_muted = muted == JNI_TRUE;
+        if librustdesk::flutter_ffi::session_get_toggle_option(session_id, "disable-audio".to_string())
+            != Some(want_muted)
+        {
+            librustdesk::flutter_ffi::session_toggle_option(session_id, "disable-audio".to_string());
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_isAudioMuted<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jboolean {
+    guard(JNI_FALSE, move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return JNI_FALSE;
+        };
+        if librustdesk::flutter_ffi::session_get_toggle_option(session_id, "disable-audio".to_string())
+            == Some(true)
+        {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
         }
     })
 }

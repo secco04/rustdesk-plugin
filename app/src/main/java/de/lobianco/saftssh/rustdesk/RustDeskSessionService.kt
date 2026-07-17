@@ -13,6 +13,9 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.RectF
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
@@ -35,6 +38,12 @@ private const val NOTIF_ID = 3001
 private const val BLIT_RETRY_INTERVAL_MS = 2000L
 // Clipboard changes are rare compared to video frames — no need to poll anywhere near as often.
 private const val CLIPBOARD_POLL_INTERVAL_MS = 500L
+// Opus frames arrive roughly every ~20-60ms — poll faster than video so the AudioTrack buffer
+// never starves (an underrun is audible as a click/gap, unlike a slightly-late video frame).
+private const val AUDIO_POLL_INTERVAL_MS = 20L
+// Generous per-poll cap: at 48kHz stereo this is ~340ms of audio in one drain, far more than one
+// poll interval could ever accumulate under normal conditions — just a safety bound, not a target.
+private const val AUDIO_POLL_MAX_SAMPLES = 32_768
 // NativeBridge.pollCursor's blob header: 4 little-endian i32 (width, height, hotx, hoty) ahead of
 // the RGBA pixels. Must match the JNI export's layout exactly.
 private const val CURSOR_HEADER_BYTES = 16
@@ -349,8 +358,86 @@ class RustDeskSessionService : Service() {
             start()
         }
 
+        // Built lazily by pumpAudio() once the peer's format is known (and rebuilt whenever it
+        // changes mid-session) — there's no fixed format to construct against up front, unlike
+        // e.g. a local media player. Only ever touched from the audio poll thread itself, so no
+        // extra synchronization beyond @Volatile (destroyInternal() reads/releases it from the
+        // Binder thread that called destroy(), after audioPollThread.interrupt() has already been
+        // issued — a benign race with the poll thread's own final iteration at worst).
+        @Volatile private var audioTrack: AudioTrack? = null
+        private var audioSampleRate = 0
+        private var audioChannels = 0
+
+        private val audioPollThread = Thread({ pumpAudio() }, "RustDesk-audio-$sessionId").apply {
+            isDaemon = true
+            start()
+        }
+
         init {
             clipboardManager?.addPrimaryClipChangedListener(clipboardListener)
+        }
+
+        /** Polls decoded PCM (and format changes) from the native side and streams it to an
+         *  android.media.AudioTrack in STREAM/WRITE_BLOCKING mode. Mirrors pumpClipboard's shape;
+         *  runs noticeably more often since audio has much tighter latency/continuity needs than
+         *  clipboard polling. */
+        private fun pumpAudio() {
+            try {
+                while (running) {
+                    NativeBridge.pollAudioFormat(sessionId)?.let { format ->
+                        val sampleRate = format.getOrElse(0) { 0 }
+                        val channels = format.getOrElse(1) { 0 }
+                        if (sampleRate > 0 && channels > 0 && (sampleRate != audioSampleRate || channels != audioChannels)) {
+                            Log.i(TAG, "pumpAudio($sessionId): format changed to ${sampleRate}Hz/${channels}ch")
+                            audioTrack?.let { runCatching { it.stop(); it.release() } }
+                            audioTrack = buildAudioTrack(sampleRate, channels)
+                            audioSampleRate = sampleRate
+                            audioChannels = channels
+                        }
+                    }
+                    val track = audioTrack
+                    if (track != null) {
+                        val samples = NativeBridge.pollAudioPcm(sessionId, AUDIO_POLL_MAX_SAMPLES)
+                        if (samples != null && samples.isNotEmpty()) {
+                            // WRITE_BLOCKING is intentional here — this thread does nothing else
+                            // that latency-sensitive input touches, so blocking until the track
+                            // has room is the simplest way to pace playback to real time (the same
+                            // backpressure a blocking write to a sound device always provides).
+                            runCatching { track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING) }
+                                .onFailure { Log.w(TAG, "pumpAudio($sessionId): AudioTrack.write failed: ${it.message}") }
+                        }
+                    }
+                    Thread.sleep(AUDIO_POLL_INTERVAL_MS)
+                }
+            } catch (_: InterruptedException) {
+                // destroy() interrupts this thread to stop it promptly — same reasoning as
+                // pumpVideo's/pumpClipboard's identical catch.
+                Log.i(TAG, "pumpAudio($sessionId) interrupted — stopping cleanly")
+            }
+        }
+
+        private fun buildAudioTrack(sampleRate: Int, channels: Int): AudioTrack {
+            val channelMask = if (channels >= 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
+            val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_FLOAT)
+                .coerceAtLeast(sampleRate * channels) // at least ~1s worth as a floor against a bogus/tiny getMinBufferSize result
+            return AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelMask)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBufferSize * 4) // f32 = 4 bytes/sample
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+                .also { it.play() }
         }
 
         /** Polls the peer's clipboard text at a much coarser interval than video (clipboard
@@ -690,6 +777,16 @@ class RustDeskSessionService : Service() {
             currentBitmap?.let { blitToSurface(it) }
         }
 
+        override fun setAudioMuted(muted: Boolean) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.setAudioMuted(sessionId, muted)
+        }
+
+        override fun isAudioMuted(): Boolean {
+            if (!isCallerAuthorized()) return false
+            return NativeBridge.isAudioMuted(sessionId)
+        }
+
         override fun destroy() {
             if (!isCallerAuthorized()) return
             destroyInternal()
@@ -705,7 +802,10 @@ class RustDeskSessionService : Service() {
             running = false
             videoThread.interrupt()
             clipboardPollThread.interrupt()
+            audioPollThread.interrupt()
             clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
+            audioTrack?.let { runCatching { it.stop(); it.release() } }
+            audioTrack = null
             surface = null
             NativeBridge.disconnect(sessionId)
             openSessions.remove(this)
