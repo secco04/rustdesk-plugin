@@ -92,6 +92,27 @@ interface IRustDeskSession {
     /** Current mute state. Quick synchronous native field read, same cost class as isAlive(). */
     boolean isAudioMuted();
 
+    /** Whether the connected peer advertised privacy-mode support at all (blanking the peer's own
+     *  physical display while remotely controlled). Quick synchronous field read, same cost class
+     *  as isAlive(). */
+    boolean isPrivacyModeSupported();
+
+    /** The privacy-mode implementation key to pass to setPrivacyMode — never null, an empty
+     *  string means unsupported/not known yet (the peer can offer several; this picks whichever it
+     *  listed first, since there's no UI here to choose among multiple). */
+    String getDefaultPrivacyModeImpl();
+
+    /** Turns privacy mode on/off for the peer's own physical display. [implKey] should come from
+     *  getDefaultPrivacyModeImpl — sending one the peer doesn't support is a harmless no-op on its
+     *  side. oneway: fire-and-forget, same reasoning as setZoom/setCursorOptions — the peer's
+     *  actual resulting state (it can take a moment, or fail — e.g. no permission on the host) is
+     *  read back separately via isPrivacyModeOn. */
+    oneway void setPrivacyMode(String implKey, boolean on);
+
+    /** Current confirmed privacy-mode state — reflects the peer's own reported outcome, not just
+     *  whether it was requested, so a rejected/failed request correctly reads back false. */
+    boolean isPrivacyModeOn();
+
     /** Tears down the connection. oneway: native teardown can block for an unbounded time (same
      *  reasoning as IRemoteDesktopSession.destroy() in the VNC/RDP/Proxmox VE plugin). */
     oneway void destroy();

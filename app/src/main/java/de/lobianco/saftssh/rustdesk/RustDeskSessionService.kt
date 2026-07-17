@@ -792,6 +792,26 @@ class RustDeskSessionService : Service() {
             return NativeBridge.isAudioMuted(sessionId)
         }
 
+        override fun isPrivacyModeSupported(): Boolean {
+            if (!isCallerAuthorized()) return false
+            return NativeBridge.isPrivacyModeSupported(sessionId)
+        }
+
+        override fun getDefaultPrivacyModeImpl(): String {
+            if (!isCallerAuthorized()) return ""
+            return NativeBridge.getDefaultPrivacyModeImpl(sessionId)
+        }
+
+        override fun setPrivacyMode(implKey: String, on: Boolean) {
+            if (!isCallerAuthorized()) return
+            NativeBridge.setPrivacyMode(sessionId, implKey, on)
+        }
+
+        override fun isPrivacyModeOn(): Boolean {
+            if (!isCallerAuthorized()) return false
+            return NativeBridge.isPrivacyModeOn(sessionId)
+        }
+
         override fun destroy() {
             if (!isCallerAuthorized()) return
             destroyInternal()

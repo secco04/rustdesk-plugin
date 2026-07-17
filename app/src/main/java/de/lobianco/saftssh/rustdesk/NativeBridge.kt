@@ -107,6 +107,23 @@ object NativeBridge {
      *  new display's size/first frame arrive through the normal getDisplaySize/getFrame polling. */
     external fun switchDisplay(sessionId: String, display: Int)
 
+    // ── Privacy mode ─────────────────────────────────────────────────────────────────────────
+
+    /** Whether the connected peer advertised privacy-mode support at all. */
+    external fun isPrivacyModeSupported(sessionId: String): Boolean
+
+    /** The privacy-mode implementation key to pass to [setPrivacyMode] — never null, an empty
+     *  string means unsupported/not known yet. */
+    external fun getDefaultPrivacyModeImpl(sessionId: String): String
+
+    /** Turns privacy mode on/off for the peer's own physical display. Fire-and-forget — the
+     *  peer's actual resulting state is read back separately via [isPrivacyModeOn]. */
+    external fun setPrivacyMode(sessionId: String, implKey: String, on: Boolean)
+
+    /** Current confirmed privacy-mode state (reflects the peer's own reported outcome, not just
+     *  whether it was requested). */
+    external fun isPrivacyModeOn(sessionId: String): Boolean
+
     // ── Audio playback ──────────────────────────────────────────────────────────────────────
 
     /** [sampleRate, channels], or null if the peer's audio format hasn't (re)negotiated since the
