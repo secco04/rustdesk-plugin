@@ -124,6 +124,19 @@ object NativeBridge {
      *  whether it was requested). */
     external fun isPrivacyModeOn(sessionId: String): Boolean
 
+    // ── View camera (read-only: a camera device attached to the host, not the host's screen) ──
+
+    /** Whether the peer advertised a camera to view. Call on the CONTROL [sessionId] (the one from
+     *  [connect]) once connected — decides whether to offer a "View Camera" entry point at all. */
+    external fun isViewCameraSupported(sessionId: String): Boolean
+
+    /** Opens a dedicated VIEW-CAMERA session to [id] (Remote ID) + [password] — a separate session
+     *  from [connect]'s control/video one (different ConnType), so both can be open to the same
+     *  peer at once. Returns the new session id as a UUID string, or "ERR:<message>" on failure.
+     *  Read-only: reuses [getDisplaySize]/[getFrame]/[isAlive]/[disconnect] — do not wire up
+     *  [sendMouse]/[inputKey] for this session, they're meaningless on a camera feed. */
+    external fun connectViewCamera(id: String, password: String): String
+
     // ── Audio playback ──────────────────────────────────────────────────────────────────────
 
     /** [sampleRate, channels], or null if the peer's audio format hasn't (re)negotiated since the

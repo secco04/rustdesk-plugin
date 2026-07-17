@@ -64,4 +64,24 @@ interface IRustDeskSessionService {
         String key,
         in IRustDeskFileTransferCallback callback
     );
+
+    /**
+     * Opens a SEPARATE, read-only connection to the same peer for viewing a camera device attached
+     * to the host — a distinct RustDesk ConnType, same reasoning as createFileTransferSession (the
+     * host silently ignores camera video on a normal control connection). Returns the SAME
+     * IRustDeskSession shape as createSession (video-frame polling is generic over session type —
+     * see NativeBridge.connectViewCamera's doc); callers should only use updateSurface/isAlive/
+     * getDisplaySize-equivalent/destroy on it — sendMouse/inputKey are meaningless here. Returns
+     * null if the connection could not even be started (see logcat).
+     */
+    IRustDeskSession createViewCameraSession(
+        String id,
+        String password,
+        String idServer,
+        String relayServer,
+        String apiServer,
+        String key,
+        in Surface surface,
+        in IRustDeskSessionCallback callback
+    );
 }

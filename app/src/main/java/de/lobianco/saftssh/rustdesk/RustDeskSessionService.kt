@@ -225,6 +225,31 @@ class RustDeskSessionService : Service() {
             promoteToForeground()
             return session
         }
+
+        override fun createViewCameraSession(
+            id: String,
+            password: String,
+            idServer: String,
+            relayServer: String,
+            apiServer: String,
+            key: String,
+            surface: Surface?,
+            callback: IRustDeskSessionCallback?
+        ): IRustDeskSession? {
+            if (!isCallerAuthorized()) return null
+            NativeBridge.setServerConfig(idServer, relayServer, apiServer, key)
+            val result = NativeBridge.connectViewCamera(id, password)
+            if (result.startsWith("ERR:")) {
+                val reason = result.removePrefix("ERR:")
+                Log.e(TAG, "connectViewCamera($id) failed: $reason")
+                runCatching { callback?.onDisconnected(reason) }
+                return null
+            }
+            val session = RustDeskSessionImpl(result, surface, callback)
+            openSessions.add(session)
+            promoteToForeground()
+            return session
+        }
     }
 
     private inner class RustDeskSessionImpl(
@@ -810,6 +835,11 @@ class RustDeskSessionService : Service() {
         override fun isPrivacyModeOn(): Boolean {
             if (!isCallerAuthorized()) return false
             return NativeBridge.isPrivacyModeOn(sessionId)
+        }
+
+        override fun isViewCameraSupported(): Boolean {
+            if (!isCallerAuthorized()) return false
+            return NativeBridge.isViewCameraSupported(sessionId)
         }
 
         override fun destroy() {

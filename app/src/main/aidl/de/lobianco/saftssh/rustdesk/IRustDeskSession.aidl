@@ -113,6 +113,12 @@ interface IRustDeskSession {
      *  whether it was requested, so a rejected/failed request correctly reads back false. */
     boolean isPrivacyModeOn();
 
+    /** Whether the connected peer advertised a camera to view. Call on a normal control session
+     *  (from createSession, not createViewCameraSession) once connected — decides whether to offer
+     *  a "View Camera" entry point at all before opening the dedicated view-camera session. Quick
+     *  synchronous native field read, same cost class as isAlive(). */
+    boolean isViewCameraSupported();
+
     /** Tears down the connection. oneway: native teardown can block for an unbounded time (same
      *  reasoning as IRemoteDesktopSession.destroy() in the VNC/RDP/Proxmox VE plugin). */
     oneway void destroy();

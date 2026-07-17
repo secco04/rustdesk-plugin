@@ -586,6 +586,144 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_isAudioMut
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Privacy mode (plans/soft-frolicking-thimble.md): blanks the peer's own physical display while
+// connected, so someone standing at the host can't see what's being done remotely. The toggle and
+// state-read primitives already existed fully in upstream (`session_toggle_privacy_mode`,
+// `session_get_toggle_option("privacy-mode")` — the SAME generic function `isAudioMuted` above
+// already uses for a different option name) — only the two "does the peer even support this, and
+// with which impl" getters were missing headless, added to flutter.rs this round.
+// ---------------------------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_isPrivacyModeSupported<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jboolean {
+    guard(JNI_FALSE, move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return JNI_FALSE;
+        };
+        if librustdesk::flutter::session_is_privacy_mode_supported(session_id) {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
+/// The privacy-mode implementation key to use for this peer (see
+/// `librustdesk::flutter::session_default_privacy_mode_impl`'s doc), or an empty string if the
+/// peer doesn't support privacy mode / hasn't been parsed yet — never null, so the caller can
+/// treat "unsupported" and "not known yet" identically without a separate null check.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_getDefaultPrivacyModeImpl<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return std::ptr::null_mut();
+        };
+        let impl_key = librustdesk::flutter::session_default_privacy_mode_impl(session_id);
+        env.new_string(impl_key)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Turns privacy mode on/off for the peer's own physical display. [implKey] should come from
+/// [getDefaultPrivacyModeImpl] — sending an impl_key the peer doesn't actually support is a no-op
+/// on the peer's side (it just reports back "not supported" via its own state, doesn't error).
+/// Fire-and-forget: the peer's ACTUAL resulting state (it can take a moment, or fail — e.g. no
+/// permission on the host) is read back separately via [isPrivacyModeOn].
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_setPrivacyMode<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    impl_key: JString<'local>,
+    on: jboolean,
+) {
+    guard((), move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return;
+        };
+        let impl_key: String = env
+            .get_string(&impl_key)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        librustdesk::flutter_ffi::session_toggle_privacy_mode(session_id, impl_key, on == JNI_TRUE);
+    })
+}
+
+/// Current confirmed privacy-mode state — reflects the peer's own reported outcome (see
+/// `client::io_loop`'s `handle_back_msg_privacy_mode`), not just "did we ask for it", so a
+/// rejected/failed request correctly reads back false rather than whatever was last requested.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_isPrivacyModeOn<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jboolean {
+    guard(JNI_FALSE, move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return JNI_FALSE;
+        };
+        if librustdesk::flutter_ffi::session_get_toggle_option(session_id, "privacy-mode".to_string())
+            == Some(true)
+        {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
+/// Whether the peer advertised a camera to view (`PeerInfo.platform_additions`'s own
+/// `"support_view_camera"` flag). Call this on the CONTROL session (the one from `connect()`) once
+/// connected — it decides whether to show a "View Camera" entry point at all before opening the
+/// dedicated view-camera session via `connectViewCamera`.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_isViewCameraSupported<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jboolean {
+    guard(JNI_FALSE, move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return JNI_FALSE;
+        };
+        if librustdesk::flutter::session_is_view_camera_supported(session_id) {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
 /// M4 (plans/soft-frolicking-thimble.md): mouse input. `mouseType` is one of "" (plain move),
 /// "down", "up", "wheel" — matches `flutter_ffi::session_send_mouse`'s JSON `type` field exactly
 /// (see that function's `match` for the full list; unrecognized strings are silently ignored on
@@ -1181,5 +1319,82 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_ftRenameRe
             .map(|s| s.into())
             .unwrap_or_default();
         librustdesk::flutter_ffi::session_rename_file(session_id, job_id, path, new_name, true);
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// View Camera (read-only: view a camera device attached to the host, not the host's screen).
+//
+// Same idea as file transfer: a THIRD, fully separate session keyed by ConnType::VIEW_CAMERA, so
+// it can be open alongside (or instead of) the control/video session to the same peer. Unlike
+// file transfer, the host DOES stream video here (the camera feed instead of the screen), and
+// that video arrives through the exact same VideoFrame handling as the control session — display
+// index, frame decode, and the getDisplaySize/getFrame/isAlive polling surface are all generic
+// over SessionID and require no view-camera-specific branching (confirmed by reading client.rs:
+// `is_view_camera` only affects the login request's ConnType and a `record_screen(..., is_view_camera)`
+// bool passed straight through to the same recorder used for the control session). So this is
+// "just" a login-time flag: reuse getFrame/getDisplaySize/isAlive/destroy for everything after
+// connect.
+// ---------------------------------------------------------------------------------------------
+
+/// Opens a dedicated VIEW-CAMERA session to `id` (Remote ID) + `password`. Returns the new session
+/// id as a UUID string on success, or "ERR:<message>" on failure. Read-only: no mouse/keyboard
+/// input is meaningful on a camera feed, so callers should only poll getDisplaySize/getFrame and
+/// call disconnect() when done — do not wire up sendMouse/inputKey for this session.
+///
+/// Like `connect()`, pokes codec-preference=vp9 (camera frames are still real video, subject to
+/// the same AV1-stub decode gap). Deliberately does NOT poke show-remote-cursor — there is no
+/// cursor to overlay on a camera feed.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connectViewCamera<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    id: JString<'local>,
+    password: JString<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let id: String = env.get_string(&id).map(|s| s.into()).unwrap_or_default();
+        let password: String = env
+            .get_string(&password)
+            .map(|s| s.into())
+            .unwrap_or_default();
+
+        let result = if id.is_empty() {
+            "ERR:Remote ID must not be empty".to_string()
+        } else {
+            let session_id = Uuid::new_v4();
+            let add_result = librustdesk::flutter_ffi::session_add_sync(
+                session_id,
+                id.clone(),
+                false, // is_file_transfer
+                true,  // is_view_camera -> ConnType::VIEW_CAMERA
+                false, // is_port_forward
+                false, // is_rdp
+                false, // is_terminal
+                String::new(), // switch_uuid
+                false, // force_relay
+                password,
+                false, // is_shared_password
+                None,  // conn_token
+            );
+            if !add_result.0.is_empty() {
+                format!("ERR:{}", add_result.0)
+            } else {
+                // See connect()'s own comment for why this is needed at all: without it the host
+                // defaults to AV1, which our stubbed aom.rs can't decode.
+                librustdesk::flutter_ffi::session_peer_option(
+                    session_id,
+                    "codec-preference".to_string(),
+                    "vp9".to_string(),
+                );
+                match librustdesk::flutter::session_start_headless(&session_id, &id) {
+                    Ok(()) => session_id.to_string(),
+                    Err(e) => format!("ERR:{}", e),
+                }
+            }
+        };
+        env.new_string(result)
+            .expect("Couldn't create Java string")
+            .into_raw()
     })
 }
