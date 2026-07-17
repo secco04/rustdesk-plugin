@@ -434,6 +434,32 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollCursor
     })
 }
 
+/// Auto quality / connection stats (plans/soft-frolicking-thimble.md): the latest known connection
+/// stats as a JSON string — see `librustdesk::flutter::take_headless_quality_status`'s doc for the
+/// exact shape. Always non-null (an empty `"{}"` object, never `null`, when nothing is known yet)
+/// since "no stats yet" is a normal, expected state for the first second or two of a session, not
+/// an error the caller needs to branch on separately from "stats with some fields missing".
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollQualityStatus<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let session_id_str: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        if Uuid::parse_str(&session_id_str).is_err() {
+            return std::ptr::null_mut();
+        }
+        let json = librustdesk::flutter::take_headless_quality_status();
+        env.new_string(json)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // Audio (plans/soft-frolicking-thimble.md, "Audio" round): playback. `AudioHandler` (client.rs)
 // decodes each incoming frame on its own dedicated thread — already headless-safe, no push_event

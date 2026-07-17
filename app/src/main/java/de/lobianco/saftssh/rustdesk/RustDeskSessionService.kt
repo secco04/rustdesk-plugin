@@ -745,6 +745,11 @@ class RustDeskSessionService : Service() {
             return NativeBridge.getDisplayCount(sessionId)
         }
 
+        override fun getQualityStatus(): String? {
+            if (!isCallerAuthorized()) return null
+            return NativeBridge.pollQualityStatus(sessionId)
+        }
+
         override fun switchDisplay(display: Int) {
             if (!isCallerAuthorized()) return
             currentDisplay = display

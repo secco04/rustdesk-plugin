@@ -47,6 +47,13 @@ interface IRustDeskSession {
      *  after connect). Quick synchronous native field read, same cost class as isAlive(). */
     int getDisplayCount();
 
+    /** Latest known connection stats as a JSON object — RustDesk's own periodic TestDelay
+     *  ping-pong and stats tick already produce this, no extra request to the peer needed. Layout:
+     *  `{"speed":"1.2MB/s","fps":30,"delay":45,"target_bitrate":2000,"codec_format":"VP9"}` — any
+     *  field not yet known is simply omitted, never `"{}"` is possible before anything has arrived.
+     *  Meant for an auto-quality heuristic and/or a latency/bandwidth readout in the UI. */
+    String getQualityStatus();
+
     /** Switches which single display (0-based index) this session captures/views — we only ever
      *  render one display at a time, never several side by side. oneway: fire-and-forget, same as
      *  setZoom; the new display's size/first frame arrive through the normal getDisplaySize/
