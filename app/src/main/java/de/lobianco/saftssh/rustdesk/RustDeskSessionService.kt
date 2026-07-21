@@ -723,7 +723,24 @@ class RustDeskSessionService : Service() {
             // rejects this immediate redraw (see consecutiveBlitFailures' doc), pendingResizeRedraw
             // makes pumpVideo keep retrying until it lands, so it re-fits within a frame or two with
             // no input either way.
-            pendingResizeRedraw = currentBitmap?.let { !blitToSurface(it) } ?: false
+            //
+            // Sharing lastExtraBlitMs's 16ms budget: an animated IME/key-bar show/hide fires this
+            // callback many times (once per resize frame of the animation, not once total), and
+            // this used to force a real synchronized lockCanvas()/unlockCanvasAndPost() call EVERY
+            // single time with no rate limit — contending for renderLock against the video-pump
+            // thread's real frames and against sendMouse's own throttled redraw. That's still
+            // reported as the connection/input feeling "stockend" during the resize even after the
+            // escalation-threshold fix (which only prevented a hard multi-second freeze, not this
+            // lock contention). Capping to the same ~60/sec budget as sendMouse/setZoom fixes it;
+            // pendingResizeRedraw still guarantees the final-size frame lands via pumpVideo's own
+            // single-threaded (and already 16ms-paced) retry loop either way.
+            val now = System.currentTimeMillis()
+            if (now - lastExtraBlitMs >= 16L) {
+                lastExtraBlitMs = now
+                pendingResizeRedraw = currentBitmap?.let { !blitToSurface(it) } ?: false
+            } else {
+                pendingResizeRedraw = true
+            }
         }
 
         override fun sendMouse(x: Int, y: Int, mouseType: String?, buttons: String?) {
