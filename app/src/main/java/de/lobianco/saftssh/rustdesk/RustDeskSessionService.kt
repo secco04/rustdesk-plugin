@@ -60,9 +60,16 @@ private data class DownloadTempFile(val file: File, val suggestedName: String, v
 // typical 32px desktop cursor ~64px on a phone, roughly matching the synthetic arrow's own size.
 private const val HOST_CURSOR_BASE_SCALE = 2.0f
 // Consecutive failures required before the above backoff engages — see consecutiveBlitFailures'
-// doc: a single resize-triggered miss self-heals on the very next frame and shouldn't cost a
-// multi-second stall; only a sustained run of failures should.
-private const val BLIT_FAILURE_ESCALATION_THRESHOLD = 3
+// doc. pumpVideo's pendingResizeRedraw retry (a static host screen with no new frames, e.g. while
+// the IME/key-bar/input-box animates in) loops at a plain Thread.sleep(16) cadence — a Surface
+// resize's BufferQueue commonly takes 100-300ms to settle, i.e. ~10-20 failed attempts at that
+// cadence. The old threshold of 3 (~48ms) was reliably blown through by an ordinary resize alone,
+// tripping the SAME BLIT_RETRY_INTERVAL_MS backoff meant only for a genuinely stuck Surface
+// (display off) and freezing the visible cursor/redraw for up to that whole interval — reported as
+// "1-3s before the mouse/stream responds again" on every IME/key-bar/input-box toggle. 60 (~1s of
+// retries at the 16ms cadence) comfortably outlasts a resize settle while still escalating for a
+// real persistent failure well within a second.
+private const val BLIT_FAILURE_ESCALATION_THRESHOLD = 60
 // File-transfer events (dir listings, job progress/done/error, overwrite prompts) are far rarer
 // than video frames — no need to poll anywhere near that often.
 private const val FILE_TRANSFER_POLL_INTERVAL_MS = 250L
