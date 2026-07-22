@@ -16,7 +16,7 @@
     </queries>
 
     <application
-        android:label="LobiShell RustDesk Plugin"
+        android:label="RustDesk Plugin for LobiShell (Unofficial)"
         android:allowBackup="false"
         android:supportsRtl="true"
         android:icon="@mipmap/ic_launcher">
