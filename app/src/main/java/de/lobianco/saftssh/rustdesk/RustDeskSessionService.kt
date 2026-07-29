@@ -774,9 +774,9 @@ class RustDeskSessionService : Service() {
             }
         }
 
-        override fun inputKey(name: String?, down: Boolean, press: Boolean, ctrl: Boolean, alt: Boolean) {
+        override fun inputKey(name: String?, down: Boolean, press: Boolean, ctrl: Boolean, alt: Boolean, shift: Boolean) {
             if (!isCallerAuthorized()) return
-            NativeBridge.inputKey(sessionId, name.orEmpty(), down, press, ctrl, alt)
+            NativeBridge.inputKey(sessionId, name.orEmpty(), down, press, ctrl, alt, shift)
         }
 
         override fun inputString(value: String?) {

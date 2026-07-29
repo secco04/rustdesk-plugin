@@ -775,14 +775,17 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_sendMouse<
 /// `client.rs`'s `KEY_MAP` for the full table — e.g. "VK_BACK", "VK_RETURN", "VK_ESCAPE", "VK_TAB",
 /// "VK_LEFT"/"VK_UP"/"VK_RIGHT"/"VK_DOWN", "VK_A".."VK_Z"/"VK_0".."VK_9"). `press` = true sends a
 /// down+up pair in one call (used for the special-key bar); false requires a separate down/up call
-/// each. `ctrl`/`alt` are forwarded into `session_input_key`'s own modifier flags — NOT redundant
-/// with a separately-sent "VK_CONTROL down" event: RustDesk's key-injection path
+/// each. `ctrl`/`alt`/`shift` are forwarded into `session_input_key`'s own modifier flags — NOT
+/// redundant with a separately-sent "VK_CONTROL down" event: RustDesk's key-injection path
 /// (`keyboard::client::legacy_modifiers`) sets the actual KeyEvent's modifier bits from these
 /// params directly, and for printable characters (`Key::Chr`/`Key::_Raw` — i.e. any VK_A.."VK_Z"/
 /// VK_0.."VK_9" tap) the remote synthesizes the keystroke via Unicode/character injection, which
-/// bypasses OS-level modifier-key tracking entirely — a separately-held Ctrl key has NO effect on
-/// it. Confirmed on-device: Ctrl-latched + typed "a" produced a literal "a" on the remote, not
-/// Ctrl+A, until these flags were threaded through (previously hardcoded to false here).
+/// bypasses OS-level modifier-key tracking entirely — a separately-held Ctrl/Shift key has NO
+/// effect on it. Confirmed on-device: Ctrl-latched + typed "a" produced a literal "a" on the
+/// remote, not Ctrl+A, until ctrl/alt were threaded through (previously hardcoded to false here) —
+/// `shift` had the exact same bug (Shift+Tab from the special-key bar never reached the remote)
+/// until it was threaded through too. `command` (macOS Cmd) is not exposed by this bar at all, so
+/// it stays hardcoded false.
 #[no_mangle]
 pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_inputKey<'local>(
     mut env: JNIEnv<'local>,
@@ -793,6 +796,7 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_inputKey<'
     press: jboolean,
     ctrl: jboolean,
     alt: jboolean,
+    shift: jboolean,
 ) {
     guard((), move || {
         let session_id_str: String = env
@@ -810,7 +814,7 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_inputKey<'
             press == JNI_TRUE,
             alt == JNI_TRUE,
             ctrl == JNI_TRUE,
-            false,
+            shift == JNI_TRUE,
             false,
         );
     })
