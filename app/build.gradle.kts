@@ -29,8 +29,8 @@ android {
         applicationId = "de.lobianco.saftssh.rustdesk"
         minSdk = 26
         targetSdk = 37
-        versionCode = 7
-        versionName = "0.7"
+        versionCode = 9
+        versionName = "0.9"
     }
 
     buildFeatures {

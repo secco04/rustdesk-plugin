@@ -73,6 +73,17 @@ private const val BLIT_FAILURE_ESCALATION_THRESHOLD = 60
 // File-transfer events (dir listings, job progress/done/error, overwrite prompts) are far rarer
 // than video frames — no need to poll anywhere near that often.
 private const val FILE_TRANSFER_POLL_INTERVAL_MS = 250L
+// pumpVideo's stall watchdog: how often to dump a full diagnostic snapshot while NOT A SINGLE frame
+// has been drawn yet. The reported "mouse works but the picture stays black" failure mode used to
+// produce literally zero log output — every silent path (no frame ever decoded, or every frame
+// dropped on a size mismatch) just looped quietly — which is exactly why it was undiagnosable from
+// a submitted log. Deliberately only active until the first successful blit, so a healthy session
+// costs nothing.
+private const val VIDEO_STALL_LOG_INTERVAL_MS = 5000L
+// See pumpVideo's real-frame counter comment — periodic heartbeat once real decoded frames start
+// arriving, so a "clean log but still black" report can be told apart from "no real frames ever
+// arrived at all" without flooding logcat at full frame rate.
+private const val REAL_FRAME_LOG_INTERVAL_MS = 2000L
 
 /** IMPORTANT: this check must live in the AIDL Stub's method bodies, NOT in Service.onBind() —
  *  onBind() is a local lifecycle callback dispatched by this process's own ActivityThread, not a
@@ -266,7 +277,6 @@ class RustDeskSessionService : Service() {
     ) : IRustDeskSession.Stub() {
 
         @Volatile private var running = true
-        private var announcedConnected = false
         private var loggedFirstBlit = false
         // Diagnostic (Round 26): logs whenever the canvas (Surface) dimensions actually change, to
         // confirm on-device whether opening the IME / special-key bar really resizes the Surface
@@ -276,6 +286,23 @@ class RustDeskSessionService : Service() {
         private var lastLoggedCanvasW = 0
         private var lastLoggedCanvasH = 0
         private var blitFailLogCount = 0
+        // See blitToSurface's dst-rect comment — the scale/dst that were live at the moment a
+        // drawBitmap-family call threw, read back by the catch block's diagnostic log. Only ever
+        // touched from blitToSurface, which is itself synchronized(renderLock).
+        private var lastBlitScale: Float? = null
+        private var lastBlitDst: RectF? = null
+        // Black-screen diagnostics (see VIDEO_STALL_LOG_INTERVAL_MS / logVideoStallIfSilent /
+        // handleFrameSizeMismatch). All only ever touched from the video-pump thread.
+        private var firstFrameSeen = false
+        private var videoStartedMs = 0L
+        private var lastStallLogMs = 0L
+        private var mismatchDropCount = 0
+        private var lastMismatchLogMs = 0L
+        // See pumpVideo's real-frame counter comment — confirms real decoded frames actually reach
+        // blitToSurface, distinct from blitToSurface's own one-shot "first frame drawn" log which
+        // can fire on a blank pre-decode bitmap.
+        private var realFrameCount = 0
+        private var lastRealFrameLogMs = 0L
 
         // Pinch-zoom transform (see setZoom / IRustDeskSession.setZoom). scale is relative to the
         // base letterbox fit; panX/panY are Surface-local pixel offsets. RustDeskScreen owns these
@@ -350,11 +377,19 @@ class RustDeskSessionService : Service() {
         // any user input.
         @Volatile private var pendingResizeRedraw = false
         // Multi-monitor: which display index pumpVideo currently polls/renders. switchDisplay()
-        // bumps this AND clears currentBitmap + announcedConnected so pumpVideo re-runs its
+        // bumps this AND clears currentBitmap so pumpVideo re-runs its
         // "discover size, then announce onConnected" sequence exactly like a fresh connect —
         // the new display can have a different resolution, and RustDeskViewModel needs the new
         // width/height for its own touch inverse-map.
         @Volatile private var currentDisplay = 0
+        // See pumpVideo's initial-display-kick comment — true once the one-shot explicit
+        // switchDisplay JNI call has fired for whatever display currentDisplay was pointing at when
+        // its size FIRST became known (i.e. the automatic default display of a fresh connect, before
+        // any user-driven switch). Deliberately fires only ONCE, ever, for this session: every LATER
+        // display change goes through the switchDisplay(Int) override below, which already sends its
+        // own explicit NativeBridge.switchDisplay() kick directly — re-kicking here too on the same
+        // change would be redundant, not wrong, but pointless, so this flag is never reset.
+        @Volatile private var initialDisplayKicked = false
         // blitToSurface() is called from three different threads (the video-pump thread, plus
         // Binder threadpool threads for sendMouse's/setZoom's own redraw) — Surface.lockCanvas()
         // isn't designed for concurrent calls from multiple threads at once, and letting them race
@@ -509,16 +544,31 @@ class RustDeskSessionService : Service() {
                     val bmp = currentBitmap ?: run {
                         val size = NativeBridge.getDisplaySize(sessionId, display)
                         if (size == null || size.size != 2 || size[0] <= 0 || size[1] <= 0) {
+                            logVideoStallIfSilent(display, "no display size from peer yet")
                             Thread.sleep(200)
                             return@run null
                         }
-                        val fresh = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888)
-                        currentBitmap = fresh
-                        if (!announcedConnected) {
-                            announcedConnected = true
-                            runCatching { callback?.onConnected(size[0], size[1]) }
+                        // Field-confirmed fix for a permanently-black INITIAL display: the peer only
+                        // actually starts CAPTURING/streaming a display once it receives an explicit
+                        // Misc::SwitchDisplay message for it (see ui_session_interface.rs's
+                        // switch_display, which both sends that message and — for non-texture-render
+                        // clients, which headless always is — calls capture_displays to kick the
+                        // capture loop). Our own switchDisplay() override already does exactly this
+                        // when the USER manually switches — but a fresh connect never called it for
+                        // whichever display currentDisplay defaults to (0), because that's a purely
+                        // local Kotlin field the peer is never told about. The peer meanwhile defaults
+                        // to capturing/streaming its own PeerInfo.current_display (NOT necessarily 0)
+                        // — display 0 specifically never got a single frame, confirmed both by the
+                        // isAlive=false stall log and, decisively, by manually switching to another
+                        // display and back: the moment display 0 receives its OWN explicit
+                        // switch_display kick, it starts working. Fire that same kick here, once,
+                        // right when we first learn the display's size — the earliest point size is
+                        // known to be valid, and before the very first getFrame() poll below.
+                        if (!initialDisplayKicked) {
+                            initialDisplayKicked = true
+                            NativeBridge.switchDisplay(sessionId, display)
                         }
-                        fresh
+                        allocateBitmap(size[0], size[1])
                     } ?: continue
                     // Cursor shape changes arrive independently of video frames (moving the mouse
                     // over a text field changes the cursor without necessarily redrawing anything),
@@ -538,13 +588,48 @@ class RustDeskSessionService : Service() {
                             // happened to trigger a redraw.
                             currentBitmap?.let { blitToSurface(it) }
                         }
+                        logVideoStallIfSilent(display, "no decoded frame available")
                         Thread.sleep(16)
                         continue
                     }
-                    if (frame.size == bmp.width * bmp.height * 4) {
-                        bmp.copyPixelsFromBuffer(ByteBuffer.wrap(frame))
-                        blitToSurface(bmp)
+                    // The frame buffer's length is the DECODED VIDEO's own w*h*4 (upstream
+                    // ImageRgb::to sizes it as h * ((w*4 + align-1) & !(align-1)), and align is 1 on
+                    // Android — no stride padding), whereas this bitmap was sized from
+                    // getDisplaySize, i.e. the resolution the peer ANNOUNCED in PeerInfo at login
+                    // time. Those two are separate sources of truth and drift apart whenever the
+                    // host's actual capture resolution isn't its announced one — a host-side
+                    // resolution/DPI change after login, RustDesk's own "adjust resolution" peer
+                    // option, or a monitor waking up at a different mode.
+                    //
+                    // This used to be a bare `if (size matches) { draw }` with no else: on any
+                    // mismatch EVERY frame was silently discarded, forever, because currentBitmap
+                    // was allocated exactly once and never revisited. Result: a permanently black
+                    // picture while input kept working perfectly (sendMouse doesn't go through this
+                    // path at all) and not one line in the log — precisely the reported symptom.
+                    // Re-read the announced size and reallocate instead.
+                    if (frame.size != bmp.width * bmp.height * 4) {
+                        handleFrameSizeMismatch(display, frame.size, bmp)
+                        continue
                     }
+                    bmp.copyPixelsFromBuffer(ByteBuffer.wrap(frame))
+                    val blitOk = blitToSurface(bmp)
+                    // Distinguishes "decoder never hands us real pixels" from "we get real pixels
+                    // but they don't end up on screen" — a case report showed a fully clean log
+                    // (VP9 decoder created, connect/audio/clipboard all fine, zero blitToSurface
+                    // exceptions) yet the picture stayed black. blitToSurface only logs its FIRST
+                    // ever call unconditionally, which — since getFrame() here can return before
+                    // the decoder even exists (see the size-mismatch/pendingResizeRedraw paths
+                    // above) — may just be the blank allocateBitmap() canvas, not real video. Every
+                    // call in THIS branch, by contrast, is guaranteed to be actual decoded RGBA
+                    // (frame.size matched the bitmap), so counting only these tells us definitively
+                    // whether real frames are reaching the Surface at all.
+                    realFrameCount++
+                    val now = System.currentTimeMillis()
+                    if (realFrameCount == 1 || now - lastRealFrameLogMs >= REAL_FRAME_LOG_INTERVAL_MS) {
+                        lastRealFrameLogMs = now
+                        Log.i(TAG, "pumpVideo($sessionId): real frame #$realFrameCount decoded+copied, blitToSurface=$blitOk")
+                    }
+                    firstFrameSeen = true
                 }
             } catch (_: InterruptedException) {
                 // destroy() calls videoThread.interrupt() to stop this loop promptly while it's
@@ -554,6 +639,86 @@ class RustDeskSessionService : Service() {
                 // RustDesk-video thread, process ended, right after a disconnect).
                 Log.i(TAG, "pumpVideo($sessionId) interrupted — stopping cleanly")
             }
+        }
+
+        /** Allocates (or replaces) the frame bitmap for a [w]x[h] remote display and announces the
+         *  size to the caller. Re-announcing on a LATER size change is deliberate and safe:
+         *  RustDeskSessionHolder.onSessionConnected just refreshes remoteWidth/remoteHeight (which
+         *  RustDeskScreen's touch inverse-mapping depends on), so a host that changes resolution
+         *  mid-session keeps landing taps in the right place instead of being silently off. */
+        private fun allocateBitmap(w: Int, h: Int): Bitmap {
+            val fresh = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            currentBitmap = fresh
+            runCatching { callback?.onConnected(w, h) }
+            return fresh
+        }
+
+        /** A decoded frame whose byte count doesn't match the bitmap we allocated (see the call
+         *  site for why the two sources drift). Re-reads the peer's announced size and reallocates
+         *  when it explains the new frame; otherwise logs everything needed to identify the case,
+         *  rate-limited so a persistent mismatch doesn't flood the log at 60/s. Either way the
+         *  frame itself is dropped — it can't be written into a differently-sized bitmap — but the
+         *  NEXT one lands once the bitmap has been resized. */
+        private fun handleFrameSizeMismatch(display: Int, frameSize: Int, bmp: Bitmap) {
+            val size = NativeBridge.getDisplaySize(sessionId, display)
+            val newW = size?.getOrNull(0) ?: 0
+            val newH = size?.getOrNull(1) ?: 0
+            if (newW > 0 && newH > 0 && (newW != bmp.width || newH != bmp.height)) {
+                Log.i(
+                    TAG,
+                    "pumpVideo($sessionId): remote display $display resized " +
+                        "${bmp.width}x${bmp.height} -> ${newW}x$newH (frame was $frameSize bytes) — reallocating"
+                )
+                allocateBitmap(newW, newH)
+                return
+            }
+            // The announced size still equals the bitmap, so the peer is telling us one resolution
+            // while encoding another. Nothing we can derive the real dimensions from here — but say
+            // so loudly, because before this the session just sat there black and mute.
+            mismatchDropCount++
+            val now = System.currentTimeMillis()
+            if (mismatchDropCount == 1 || now - lastMismatchLogMs >= VIDEO_STALL_LOG_INTERVAL_MS) {
+                lastMismatchLogMs = now
+                Log.w(
+                    TAG,
+                    "pumpVideo($sessionId): dropping frame #$mismatchDropCount for display $display — " +
+                        "frame is $frameSize bytes but the peer still announces ${bmp.width}x${bmp.height} " +
+                        "(= ${bmp.width * bmp.height * 4} bytes). Announced resolution and encoded " +
+                        "resolution disagree; picture stays black. quality=${NativeBridge.pollQualityStatus(sessionId)}"
+                )
+            }
+        }
+
+        /** Periodic diagnostic while no REAL decoded frame has EVER been drawn — the black-screen
+         *  case. Silent once a real frame lands, and silent for the first interval so a normal
+         *  connect (which takes a moment to produce its first keyframe) doesn't log anything.
+         *
+         *  Gated on [firstFrameSeen] ONLY — NOT [loggedFirstBlit]. loggedFirstBlit flips true on
+         *  the very FIRST successful blitToSurface() call, which can be (and on a field report,
+         *  reliably was) a blit of the blank pre-decode bitmap triggered by updateSurface()'s
+         *  resize-redraw path, firing before the VP9 decoder even exists. Gating on that too
+         *  permanently silenced this watchdog after that one blank draw — a full session capture
+         *  showed zero "real frame #N" lines (see pumpVideo's counter) AND zero stall warnings,
+         *  even after 11s of the peer actively streaming (audio flowing, "Set fps to 30" logged) —
+         *  because THIS check was suppressing them. */
+        private fun logVideoStallIfSilent(display: Int, reason: String) {
+            if (firstFrameSeen) return
+            val now = System.currentTimeMillis()
+            if (videoStartedMs == 0L) videoStartedMs = now
+            if (now - videoStartedMs < VIDEO_STALL_LOG_INTERVAL_MS) return
+            if (now - lastStallLogMs < VIDEO_STALL_LOG_INTERVAL_MS) return
+            lastStallLogMs = now
+            val size = NativeBridge.getDisplaySize(sessionId, display)
+            Log.w(
+                TAG,
+                "pumpVideo($sessionId): still no picture after ${(now - videoStartedMs) / 1000}s — $reason. " +
+                    "display=$display/${NativeBridge.getDisplayCount(sessionId)} " +
+                    "announcedSize=${size?.getOrNull(0) ?: -1}x${size?.getOrNull(1) ?: -1} " +
+                    "bitmap=${currentBitmap?.let { "${it.width}x${it.height}" } ?: "none"} " +
+                    "isAlive=${NativeBridge.isAlive(sessionId)} " +
+                    "surface=${surface?.isValid ?: false} blitFailing=$blitFailing " +
+                    "quality=${NativeBridge.pollQualityStatus(sessionId)}"
+            )
         }
 
         /** Picks up a new cursor shape from the peer, if one arrived since the last call. Returns
@@ -607,6 +772,10 @@ class RustDeskSessionService : Service() {
             val now = System.currentTimeMillis()
             if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return false
             lastBlitAttemptMs = now
+            // Reset so a throw from lockCanvas() ITSELF (before dst is ever computed) reads back
+            // as dst=null in the catch block's log, distinguishable from a throw after dst was set.
+            lastBlitScale = null
+            lastBlitDst = null
             try {
                 // Serializes against the OTHER threads that can call this concurrently (video-pump
                 // thread vs. Binder threadpool threads via sendMouse/setZoom) — Surface.lockCanvas()
@@ -636,8 +805,18 @@ class RustDeskSessionService : Service() {
                         // touches land at the wrong remote position.
                         val ox = (sw - dw) / 2f + panX
                         val oy = panY
+                        val dst = RectF(ox, oy, ox + dw, oy + dh)
+                        // Diagnostic for a reported persistent (not just resize-transient)
+                        // IllegalArgumentException-with-null-message from drawBitmap on some OEM
+                        // Canvas implementations (observed on a ColorOS/Oppo-family device) — the
+                        // exception itself carries no message there, so the ONLY way to tell "NaN/
+                        // Infinite/inverted rect" apart from "OEM canvas bug on an otherwise-valid
+                        // rect" is to have logged the inputs BEFORE the throw. Stored on the
+                        // instance (not just a local) so the catch block below can still read the
+                        // exact values that were live at throw time.
+                        lastBlitScale = scale; lastBlitDst = dst
                         canvas.drawColor(Color.BLACK)
-                        canvas.drawBitmap(bitmap, null, RectF(ox, oy, ox + dw, oy + dh), null)
+                        canvas.drawBitmap(bitmap, null, dst, null)
                         if (pointerFbX >= 0 && pointerFbY >= 0) {
                             val cx = ox + pointerFbX * scale
                             val cy = oy + pointerFbY * scale
@@ -687,7 +866,20 @@ class RustDeskSessionService : Service() {
                 registerBlitFailure()
                 blitFailLogCount++
                 if (blitFailLogCount <= 5 || blitFailLogCount % 50 == 0) {
-                    Log.w(TAG, "blitToSurface($sessionId) failed (#$blitFailLogCount): ${e.javaClass.simpleName}: ${e.message}")
+                    // Full stack trace (not just e.message) — on the OEM Canvas seen in the field
+                    // report, e.message is null, so the message-only line gave zero information
+                    // about WHICH call inside the try block (lockCanvas / drawColor / drawBitmap x2
+                    // / unlockCanvasAndPost) actually threw. lastBlitScale/Dst are whatever was
+                    // live at throw time (null if it never even reached that assignment, e.g.
+                    // lockCanvas itself threw) — a non-null dst with NaN/Infinite/inverted
+                    // coordinates points at bad input math; a well-formed dst points at the OEM
+                    // Canvas implementation itself rejecting an otherwise-valid draw.
+                    Log.w(
+                        TAG,
+                        "blitToSurface($sessionId) failed (#$blitFailLogCount): canvas=${lastLoggedCanvasW}x$lastLoggedCanvasH " +
+                            "bitmap=${bitmap.width}x${bitmap.height} scale=$lastBlitScale dst=$lastBlitDst",
+                        e
+                    )
                 }
                 return false
             }
@@ -807,11 +999,11 @@ class RustDeskSessionService : Service() {
         override fun switchDisplay(display: Int) {
             if (!isCallerAuthorized()) return
             currentDisplay = display
-            // Force pumpVideo's "size unknown yet" branch to run again for the new display, and
-            // let onConnected fire a second time with the new size — RustDeskViewModel needs the
-            // fresh width/height for its own touch inverse-map, same as a real fresh connect.
+            // Force pumpVideo's "size unknown yet" branch to run again for the new display, which
+            // reallocates the bitmap via allocateBitmap and so fires onConnected a second time with
+            // the new size — RustDeskViewModel needs the fresh width/height for its own touch
+            // inverse-map, same as a real fresh connect.
             currentBitmap = null
-            announcedConnected = false
             loggedFirstBlit = false
             NativeBridge.switchDisplay(sessionId, display)
         }
