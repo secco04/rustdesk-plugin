@@ -132,4 +132,23 @@ interface IRustDeskSession {
     /** Tears down the connection. oneway: native teardown can block for an unbounded time (same
      *  reasoning as IRemoteDesktopSession.destroy() in the VNC/RDP/Proxmox VE plugin). */
     oneway void destroy();
+
+    /** APPEND-ONLY ZONE: AIDL assigns transaction codes by declaration order, so a NEW method must
+     *  always be added at the very end of the interface, never inserted between existing ones — an
+     *  insertion would shift every later method's code and silently mis-dispatch calls between a
+     *  plugin/app pair on mismatched versions (e.g. an old plugin binary would answer switchDisplay
+     *  with whatever ended up at that slot instead). Add future methods below this comment, in the
+     *  same order in the main app's copy of this file. */
+
+    /** Milliseconds since the most recent REAL decoded video frame was drawn, or -1 if no real
+     *  frame has arrived yet this session (mirrors isAlive()'s "not yet" case). Backed by
+     *  elapsedRealtime, so it's immune to wall-clock adjustments. Meant for mid-session stall
+     *  detection: a silent network drop / host sleep / host shutdown often never fires
+     *  onDisconnected (the socket just stops producing data without erroring out), so the picture
+     *  freezes forever with nothing to react to. The caller is expected to combine a large value
+     *  here with an independent liveness signal (e.g. re-polling getQualityStatus()) before acting
+     *  — RustDesk only sends a new frame when the remote screen content actually changes, so a
+     *  large "time since last frame" alone is also completely normal for a genuinely idle/static
+     *  host screen and must not be treated as a stall by itself. */
+    long getMsSinceLastFrame();
 }

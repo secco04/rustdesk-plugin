@@ -21,6 +21,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
@@ -303,6 +304,16 @@ class RustDeskSessionService : Service() {
         // can fire on a blank pre-decode bitmap.
         private var realFrameCount = 0
         private var lastRealFrameLogMs = 0L
+        // elapsedRealtime() of the most recent REAL decoded frame (same qualifying condition as
+        // realFrameCount above — frame.size matched the bitmap, so this is never set by a blank
+        // pre-decode canvas). elapsedRealtime, not System.currentTimeMillis: immune to wall-clock
+        // adjustments (NTP sync, timezone/DST changes) that would otherwise corrupt an "age" reading
+        // taken by the main app's own elapsedRealtime-based watchdog (RustDeskSessionHolder). 0 means
+        // "no real frame yet" — same sentinel as videoStartedMs/lastStallLogMs above. Exposed via
+        // getMsSinceLastFrame() for the main app's mid-session stall detection (user-reported: the
+        // picture just freezes forever on a silent network drop / host sleep / host shutdown, with
+        // no onDisconnected ever firing since the socket doesn't error out).
+        @Volatile private var lastRealFrameAtMs = 0L
 
         // Pinch-zoom transform (see setZoom / IRustDeskSession.setZoom). scale is relative to the
         // base letterbox fit; panX/panY are Surface-local pixel offsets. RustDeskScreen owns these
@@ -624,6 +635,7 @@ class RustDeskSessionService : Service() {
                     // (frame.size matched the bitmap), so counting only these tells us definitively
                     // whether real frames are reaching the Surface at all.
                     realFrameCount++
+                    lastRealFrameAtMs = SystemClock.elapsedRealtime()
                     val now = System.currentTimeMillis()
                     if (realFrameCount == 1 || now - lastRealFrameLogMs >= REAL_FRAME_LOG_INTERVAL_MS) {
                         lastRealFrameLogMs = now
@@ -984,6 +996,13 @@ class RustDeskSessionService : Service() {
         override fun isAlive(): Boolean {
             if (!isCallerAuthorized()) return false
             return NativeBridge.isAlive(sessionId)
+        }
+
+        override fun getMsSinceLastFrame(): Long {
+            if (!isCallerAuthorized()) return -1L
+            val at = lastRealFrameAtMs
+            if (at == 0L) return -1L
+            return SystemClock.elapsedRealtime() - at
         }
 
         override fun getDisplayCount(): Int {
