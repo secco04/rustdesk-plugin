@@ -42,6 +42,14 @@ private const val CLIPBOARD_POLL_INTERVAL_MS = 500L
 // Opus frames arrive roughly every ~20-60ms — poll faster than video so the AudioTrack buffer
 // never starves (an underrun is audible as a click/gap, unlike a slightly-late video frame).
 private const val AUDIO_POLL_INTERVAL_MS = 20L
+// While no Surface is attached (backgrounded/tab-switched-away — main app's detachSurface() calls
+// updateSurface(null)), nothing is visible to render or worth playing audio for. pumpVideo/pumpAudio
+// back off to this coarse sleep instead of their normal tight cadence — pure CPU/battery savings,
+// since the actual data-usage fix is the native quality drop the main app applies on detach (see
+// RustDeskSessionHolder.detachSurface's doc in the saftssh repo). Deliberately does NOT apply to
+// pumpClipboard — clipboard sync stays live regardless of Surface state, since it's cheap and the
+// user may still want clipboard sync to work while the session is merely backgrounded.
+private const val BACKGROUND_NO_SURFACE_SLEEP_MS = 1_000L
 // Generous per-poll cap: at 48kHz stereo this is ~340ms of audio in one drain, far more than one
 // poll interval could ever accumulate under normal conditions — just a safety bound, not a target.
 private const val AUDIO_POLL_MAX_SAMPLES = 32_768
@@ -462,6 +470,13 @@ class RustDeskSessionService : Service() {
         private fun pumpAudio() {
             try {
                 while (running) {
+                    // No Surface attached — the RustDesk screen isn't visible, so there's no reason
+                    // to keep decoding/playing audio for it either. Same reasoning as pumpVideo's
+                    // identical check; see BACKGROUND_NO_SURFACE_SLEEP_MS's doc.
+                    if (surface == null) {
+                        Thread.sleep(BACKGROUND_NO_SURFACE_SLEEP_MS)
+                        continue
+                    }
                     NativeBridge.pollAudioFormat(sessionId)?.let { format ->
                         val sampleRate = format.getOrElse(0) { 0 }
                         val channels = format.getOrElse(1) { 0 }
@@ -548,6 +563,15 @@ class RustDeskSessionService : Service() {
         private fun pumpVideo() {
             try {
                 while (running) {
+                    // No Surface attached — nothing to draw onto (blitToSurface no-ops on this
+                    // anyway), so skip getFrame()/cursor-poll entirely rather than spinning at the
+                    // normal ~60Hz cadence for nothing. updateSurface() already re-blits currentBitmap
+                    // immediately on reattach, so this doesn't cost a visibly blank frame — see
+                    // BACKGROUND_NO_SURFACE_SLEEP_MS's doc.
+                    if (surface == null) {
+                        Thread.sleep(BACKGROUND_NO_SURFACE_SLEEP_MS)
+                        continue
+                    }
                     // Captured once per iteration (not re-read below) so a switchDisplay() call
                     // mid-iteration can't mismatch the size this bitmap was allocated for against
                     // the display getFrame reads from.
