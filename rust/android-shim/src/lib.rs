@@ -352,6 +352,40 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_getDisplay
     })
 }
 
+/// Multi-monitor origin (lobishell-android): [x, y] position of `display` within the peer's
+/// combined virtual desktop — see `session_get_display_origin`'s doc for why the Android client
+/// needs this (mouse input lands at the wrong monitor otherwise). Always returns a valid array
+/// (defaulting to [0, 0], unlike getDisplaySize's null-until-known contract) since 0,0 is itself
+/// the correct answer for a not-yet-known or primary-at-origin display — callers add this to a
+/// local tap coordinate unconditionally, and null would just complicate every call site for no
+/// benefit (an unknown origin should behave exactly like a zero origin).
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_getDisplayOrigin<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+    display: jint,
+) -> jintArray {
+    guard(std::ptr::null_mut(), move || {
+        let session_id_str: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id_str) else {
+            return std::ptr::null_mut();
+        };
+        let (x, y) = librustdesk::flutter::session_get_display_origin(session_id, display as usize);
+        let arr = match env.new_int_array(2) {
+            Ok(a) => a,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        if env.set_int_array_region(&arr, 0, &[x, y]).is_err() {
+            return std::ptr::null_mut();
+        }
+        arr.into_raw()
+    })
+}
+
 /// M3: copies the next unread RGBA frame for `display` into a fresh Java byte array and marks it
 /// consumed (`session_next_rgba`) so the decoder can write the following one. Returns null if no
 /// new frame is ready (caller just polls again) — unlike `isAlive`'s rgba-size check (which

@@ -23,7 +23,7 @@ import android.os.Environment
 import android.os.IBinder
 import android.os.SystemClock
 import android.provider.MediaStore
-import android.util.Log
+import de.lobianco.saftssh.rustdesk.data.logging.AppLog
 import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
@@ -180,7 +180,7 @@ class RustDeskSessionService : Service() {
         val callerPackages = packageManager.getPackagesForUid(callingUid) ?: arrayOf()
         val authorized = callerPackages.any { it in ALLOWED_CALLER_PACKAGES }
         if (!authorized) {
-            Log.w(TAG, "Rejected call from unauthorized caller uid=$callingUid packages=${callerPackages.joinToString()}")
+            AppLog.w(TAG, "Rejected call from unauthorized caller uid=$callingUid packages=${callerPackages.joinToString()}")
         }
         return authorized
     }
@@ -201,7 +201,7 @@ class RustDeskSessionService : Service() {
             val result = NativeBridge.connect(id, password)
             if (result.startsWith("ERR:")) {
                 val reason = result.removePrefix("ERR:")
-                Log.e(TAG, "connect($id) failed: $reason")
+                AppLog.e(TAG, "connect($id) failed: $reason")
                 runCatching { callback?.onDisconnected(reason) }
                 return null
             }
@@ -237,7 +237,7 @@ class RustDeskSessionService : Service() {
             val result = NativeBridge.connectFileTransfer(id, password)
             if (result.startsWith("ERR:")) {
                 val reason = result.removePrefix("ERR:")
-                Log.e(TAG, "connectFileTransfer($id) failed: $reason")
+                AppLog.e(TAG, "connectFileTransfer($id) failed: $reason")
                 runCatching { callback?.onDisconnected(reason) }
                 return null
             }
@@ -268,7 +268,7 @@ class RustDeskSessionService : Service() {
             val result = NativeBridge.connectViewCamera(id, password)
             if (result.startsWith("ERR:")) {
                 val reason = result.removePrefix("ERR:")
-                Log.e(TAG, "connectViewCamera($id) failed: $reason")
+                AppLog.e(TAG, "connectViewCamera($id) failed: $reason")
                 runCatching { callback?.onDisconnected(reason) }
                 return null
             }
@@ -481,7 +481,7 @@ class RustDeskSessionService : Service() {
                         val sampleRate = format.getOrElse(0) { 0 }
                         val channels = format.getOrElse(1) { 0 }
                         if (sampleRate > 0 && channels > 0 && (sampleRate != audioSampleRate || channels != audioChannels)) {
-                            Log.i(TAG, "pumpAudio($sessionId): format changed to ${sampleRate}Hz/${channels}ch")
+                            AppLog.i(TAG, "pumpAudio($sessionId): format changed to ${sampleRate}Hz/${channels}ch")
                             audioTrack?.let { runCatching { it.stop(); it.release() } }
                             audioTrack = buildAudioTrack(sampleRate, channels)
                             audioSampleRate = sampleRate
@@ -497,7 +497,7 @@ class RustDeskSessionService : Service() {
                             // has room is the simplest way to pace playback to real time (the same
                             // backpressure a blocking write to a sound device always provides).
                             runCatching { track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING) }
-                                .onFailure { Log.w(TAG, "pumpAudio($sessionId): AudioTrack.write failed: ${it.message}") }
+                                .onFailure { AppLog.w(TAG, "pumpAudio($sessionId): AudioTrack.write failed: ${it.message}") }
                         }
                     }
                     Thread.sleep(AUDIO_POLL_INTERVAL_MS)
@@ -505,7 +505,7 @@ class RustDeskSessionService : Service() {
             } catch (_: InterruptedException) {
                 // destroy() interrupts this thread to stop it promptly — same reasoning as
                 // pumpVideo's/pumpClipboard's identical catch.
-                Log.i(TAG, "pumpAudio($sessionId) interrupted — stopping cleanly")
+                AppLog.i(TAG, "pumpAudio($sessionId) interrupted — stopping cleanly")
             }
         }
 
@@ -540,7 +540,7 @@ class RustDeskSessionService : Service() {
                 while (running) {
                     val text = NativeBridge.pollRemoteClipboardText()
                     if (text != null) {
-                        Log.i(TAG, "pumpClipboard($sessionId): got ${text.length} chars from peer, writing to local clipboard")
+                        AppLog.i(TAG, "pumpClipboard($sessionId): got ${text.length} chars from peer, writing to local clipboard")
                         lastClipboardSetByUs = text
                         clipboardManager?.setPrimaryClip(ClipData.newPlainText("RustDesk", text))
                     }
@@ -549,7 +549,7 @@ class RustDeskSessionService : Service() {
             } catch (_: InterruptedException) {
                 // destroy() interrupts this thread to stop it promptly — a clean shutdown, same
                 // reasoning as pumpVideo's identical catch (see its doc).
-                Log.i(TAG, "pumpClipboard($sessionId) interrupted — stopping cleanly")
+                AppLog.i(TAG, "pumpClipboard($sessionId) interrupted — stopping cleanly")
             }
         }
 
@@ -663,7 +663,7 @@ class RustDeskSessionService : Service() {
                     val now = System.currentTimeMillis()
                     if (realFrameCount == 1 || now - lastRealFrameLogMs >= REAL_FRAME_LOG_INTERVAL_MS) {
                         lastRealFrameLogMs = now
-                        Log.i(TAG, "pumpVideo($sessionId): real frame #$realFrameCount decoded+copied, blitToSurface=$blitOk")
+                        AppLog.i(TAG, "pumpVideo($sessionId): real frame #$realFrameCount decoded+copied, blitToSurface=$blitOk")
                     }
                     firstFrameSeen = true
                 }
@@ -673,7 +673,7 @@ class RustDeskSessionService : Service() {
                 // the uncaught InterruptedException propagates to Android's default handler and
                 // SIGKILLs the whole plugin process (confirmed on-device: FATAL EXCEPTION on the
                 // RustDesk-video thread, process ended, right after a disconnect).
-                Log.i(TAG, "pumpVideo($sessionId) interrupted — stopping cleanly")
+                AppLog.i(TAG, "pumpVideo($sessionId) interrupted — stopping cleanly")
             }
         }
 
@@ -700,7 +700,7 @@ class RustDeskSessionService : Service() {
             val newW = size?.getOrNull(0) ?: 0
             val newH = size?.getOrNull(1) ?: 0
             if (newW > 0 && newH > 0 && (newW != bmp.width || newH != bmp.height)) {
-                Log.i(
+                AppLog.i(
                     TAG,
                     "pumpVideo($sessionId): remote display $display resized " +
                         "${bmp.width}x${bmp.height} -> ${newW}x$newH (frame was $frameSize bytes) — reallocating"
@@ -715,7 +715,7 @@ class RustDeskSessionService : Service() {
             val now = System.currentTimeMillis()
             if (mismatchDropCount == 1 || now - lastMismatchLogMs >= VIDEO_STALL_LOG_INTERVAL_MS) {
                 lastMismatchLogMs = now
-                Log.w(
+                AppLog.w(
                     TAG,
                     "pumpVideo($sessionId): dropping frame #$mismatchDropCount for display $display — " +
                         "frame is $frameSize bytes but the peer still announces ${bmp.width}x${bmp.height} " +
@@ -745,7 +745,7 @@ class RustDeskSessionService : Service() {
             if (now - lastStallLogMs < VIDEO_STALL_LOG_INTERVAL_MS) return
             lastStallLogMs = now
             val size = NativeBridge.getDisplaySize(sessionId, display)
-            Log.w(
+            AppLog.w(
                 TAG,
                 "pumpVideo($sessionId): still no picture after ${(now - videoStartedMs) / 1000}s — $reason. " +
                     "display=$display/${NativeBridge.getDisplayCount(sessionId)} " +
@@ -767,7 +767,7 @@ class RustDeskSessionService : Service() {
         private fun pollHostCursor(): Boolean {
             val blob = NativeBridge.pollCursor(sessionId) ?: return false
             if (blob.size < CURSOR_HEADER_BYTES) {
-                Log.w(TAG, "pollCursor($sessionId): blob too small (${blob.size} bytes), ignoring")
+                AppLog.w(TAG, "pollCursor($sessionId): blob too small (${blob.size} bytes), ignoring")
                 return false
             }
             val buf = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN)
@@ -776,7 +776,7 @@ class RustDeskSessionService : Service() {
             val hotX = buf.int
             val hotY = buf.int
             if (w <= 0 || h <= 0 || blob.size != CURSOR_HEADER_BYTES + w * h * 4) {
-                Log.w(TAG, "pollCursor($sessionId): malformed cursor w=$w h=$h size=${blob.size}, ignoring")
+                AppLog.w(TAG, "pollCursor($sessionId): malformed cursor w=$w h=$h size=${blob.size}, ignoring")
                 return false
             }
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -798,11 +798,11 @@ class RustDeskSessionService : Service() {
          *  post-resize redraw landed or still needs retrying (see pendingResizeRedraw). */
         private fun blitToSurface(bitmap: Bitmap): Boolean {
             val s = surface ?: run {
-                Log.w(TAG, "blitToSurface($sessionId): no surface set yet — nothing to draw onto")
+                AppLog.w(TAG, "blitToSurface($sessionId): no surface set yet — nothing to draw onto")
                 return false
             }
             if (!s.isValid) {
-                Log.w(TAG, "blitToSurface($sessionId): surface is not valid (torn down?), skipping frame")
+                AppLog.w(TAG, "blitToSurface($sessionId): surface is not valid (torn down?), skipping frame")
                 return false
             }
             val now = System.currentTimeMillis()
@@ -818,7 +818,7 @@ class RustDeskSessionService : Service() {
                 // isn't meant to be raced from multiple threads at once; see renderLock's doc.
                 synchronized(renderLock) {
                     val canvas: Canvas = s.lockCanvas(null) ?: run {
-                        Log.w(TAG, "blitToSurface($sessionId): lockCanvas() returned null")
+                        AppLog.w(TAG, "blitToSurface($sessionId): lockCanvas() returned null")
                         registerBlitFailure()
                         return false
                     }
@@ -826,7 +826,7 @@ class RustDeskSessionService : Service() {
                         val sw = canvas.width.toFloat()
                         val sh = canvas.height.toFloat()
                         if (canvas.width != lastLoggedCanvasW || canvas.height != lastLoggedCanvasH) {
-                            Log.i(TAG, "blitToSurface($sessionId): canvas size now ${canvas.width}x${canvas.height} (was ${lastLoggedCanvasW}x$lastLoggedCanvasH)")
+                            AppLog.i(TAG, "blitToSurface($sessionId): canvas size now ${canvas.width}x${canvas.height} (was ${lastLoggedCanvasW}x$lastLoggedCanvasH)")
                             lastLoggedCanvasW = canvas.width
                             lastLoggedCanvasH = canvas.height
                         }
@@ -885,7 +885,7 @@ class RustDeskSessionService : Service() {
                         }
                         if (!loggedFirstBlit) {
                             loggedFirstBlit = true
-                            Log.i(TAG, "blitToSurface($sessionId): first frame drawn, canvas=${sw}x$sh bitmap=${bitmap.width}x${bitmap.height}")
+                            AppLog.i(TAG, "blitToSurface($sessionId): first frame drawn, canvas=${sw}x$sh bitmap=${bitmap.width}x${bitmap.height}")
                         }
                     } finally {
                         s.unlockCanvasAndPost(canvas)
@@ -910,7 +910,7 @@ class RustDeskSessionService : Service() {
                     // lockCanvas itself threw) — a non-null dst with NaN/Infinite/inverted
                     // coordinates points at bad input math; a well-formed dst points at the OEM
                     // Canvas implementation itself rejecting an otherwise-valid draw.
-                    Log.w(
+                    AppLog.w(
                         TAG,
                         "blitToSurface($sessionId) failed (#$blitFailLogCount): canvas=${lastLoggedCanvasW}x$lastLoggedCanvasH " +
                             "bitmap=${bitmap.width}x${bitmap.height} scale=$lastBlitScale dst=$lastBlitDst",
@@ -1027,6 +1027,11 @@ class RustDeskSessionService : Service() {
             val at = lastRealFrameAtMs
             if (at == 0L) return -1L
             return SystemClock.elapsedRealtime() - at
+        }
+
+        override fun getDisplayOrigin(): IntArray {
+            if (!isCallerAuthorized()) return intArrayOf(0, 0)
+            return NativeBridge.getDisplayOrigin(sessionId, currentDisplay)
         }
 
         override fun getDisplayCount(): Int {
@@ -1175,9 +1180,9 @@ class RustDeskSessionService : Service() {
 
                     NativeBridge.ftPollDirListing(sessionId)?.let { json ->
                         gotAny = true
-                        Log.i(TAG, "ftPollDirListing($sessionId): got a listing (${json.length} chars)")
+                        AppLog.i(TAG, "ftPollDirListing($sessionId): got a listing (${json.length} chars)")
                         runCatching { callback?.onDirListing(json) }
-                            .onFailure { Log.w(TAG, "onDirListing callback failed: ${it.message}") }
+                            .onFailure { AppLog.w(TAG, "onDirListing callback failed: ${it.message}") }
                     }
 
                     NativeBridge.ftPollJobEvent(sessionId)?.let { json ->
@@ -1188,7 +1193,7 @@ class RustDeskSessionService : Service() {
                     NativeBridge.ftPollOverrideConfirm(sessionId)?.let { json ->
                         gotAny = true
                         runCatching { callback?.onOverrideConfirm(json) }
-                            .onFailure { Log.w(TAG, "onOverrideConfirm callback failed: ${it.message}") }
+                            .onFailure { AppLog.w(TAG, "onOverrideConfirm callback failed: ${it.message}") }
                     }
 
                     if (gotAny && !announcedConnected) {
@@ -1201,7 +1206,7 @@ class RustDeskSessionService : Service() {
             } catch (_: InterruptedException) {
                 // destroy() interrupts this thread to stop it promptly — a clean shutdown, same
                 // reasoning as pumpVideo's identical catch in RustDeskSessionImpl.
-                Log.i(TAG, "pumpFileTransferEvents($sessionId) interrupted — stopping cleanly")
+                AppLog.i(TAG, "pumpFileTransferEvents($sessionId) interrupted — stopping cleanly")
             }
         }
 
@@ -1228,7 +1233,7 @@ class RustDeskSessionService : Service() {
                         }
                         val augmented = JSONObject(json).put("savedUri", savedUri)
                         runCatching { callback?.onJobEvent(augmented.toString()) }
-                            .onFailure { Log.w(TAG, "onJobEvent callback failed: ${it.message}") }
+                            .onFailure { AppLog.w(TAG, "onJobEvent callback failed: ${it.message}") }
                         return
                     } else {
                         pending.file.delete()
@@ -1236,7 +1241,7 @@ class RustDeskSessionService : Service() {
                 }
             }
             runCatching { callback?.onJobEvent(json) }
-                .onFailure { Log.w(TAG, "onJobEvent callback failed: ${it.message}") }
+                .onFailure { AppLog.w(TAG, "onJobEvent callback failed: ${it.message}") }
         }
 
         /** Moves a finished download from its private temp path into the shared Downloads
@@ -1266,14 +1271,14 @@ class RustDeskSessionService : Service() {
                 tempFile.delete()
                 uri.toString()
             } catch (e: Exception) {
-                Log.w(TAG, "saveDownloadToMediaStore($suggestedName) failed: ${e.javaClass.simpleName}: ${e.message}")
+                AppLog.w(TAG, "saveDownloadToMediaStore($suggestedName) failed: ${e.javaClass.simpleName}: ${e.message}")
                 null
             }
         }
 
         override fun readRemoteDir(path: String, showHidden: Boolean) {
             if (!isCallerAuthorized()) return
-            Log.i(TAG, "readRemoteDir($sessionId, \"$path\")")
+            AppLog.i(TAG, "readRemoteDir($sessionId, \"$path\")")
             NativeBridge.ftReadRemoteDir(sessionId, path, showHidden)
         }
 
@@ -1330,7 +1335,7 @@ class RustDeskSessionService : Service() {
                 pendingReleaseFiles[jobId] = uri to tempFile
                 uri.toString()
             } catch (e: Exception) {
-                Log.w(TAG, "grantDownloadedFileUri($jobId) failed: ${e.javaClass.simpleName}: ${e.message}")
+                AppLog.w(TAG, "grantDownloadedFileUri($jobId) failed: ${e.javaClass.simpleName}: ${e.message}")
                 tempFile.delete()
                 null
             }
@@ -1360,7 +1365,7 @@ class RustDeskSessionService : Service() {
                 put("err", message)
             }.toString()
             runCatching { callback?.onJobEvent(json) }
-                .onFailure { Log.w(TAG, "onJobEvent callback failed: ${it.message}") }
+                .onFailure { AppLog.w(TAG, "onJobEvent callback failed: ${it.message}") }
         }
 
         override fun answerOverrideConfirm(jobId: Int, fileNum: Int, overwrite: Boolean, remember: Boolean, isUpload: Boolean) {

@@ -151,4 +151,15 @@ interface IRustDeskSession {
      *  large "time since last frame" alone is also completely normal for a genuinely idle/static
      *  host screen and must not be treated as a stall by itself. */
     long getMsSinceLastFrame();
+
+    /** [x, y] position of the CURRENTLY VIEWED display (see switchDisplay) within the peer's
+     *  combined virtual desktop — NOT the display's own local (0,0). Must be added to a tap's
+     *  local framebuffer coordinate before calling sendMouse, or clicks land on whatever display
+     *  actually occupies the (0,0)-relative position (typically the primary) instead of the one
+     *  being viewed — see NativeBridge.getDisplayOrigin's Rust-side doc for the full story (this
+     *  was the root cause of a reported "mouse moves on the first monitor" bug with a secondary/
+     *  non-primary display). [0, 0] if not known yet, same as an origin-at-zero display, so
+     *  callers can add it unconditionally with no null-check. Quick synchronous native field read,
+     *  same cost class as isAlive(). */
+    int[] getDisplayOrigin();
 }

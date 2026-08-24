@@ -64,6 +64,15 @@ object NativeBridge {
      *  the peer handshake completes). */
     external fun getDisplaySize(sessionId: String, display: Int): IntArray?
 
+    /** [x, y] position of `display` within the peer's COMBINED virtual desktop — not the display's
+     *  own local (0,0), but its offset in the multi-monitor arrangement. Must be added to a tap's
+     *  local framebuffer coordinate before calling [sendMouse], or clicks land on whatever display
+     *  actually occupies the (0,0)-relative position (typically the primary) instead of the one
+     *  being viewed — see session_get_display_origin's doc on the Rust side for the full story.
+     *  Always non-null, defaulting to [0, 0] when not yet known (same as an origin-at-zero display,
+     *  so callers can add it unconditionally with no null-check). */
+    external fun getDisplayOrigin(sessionId: String, display: Int): IntArray
+
     /** Copies the next unread RGBA frame for `display` into a fresh byte array — R,G,B,A per
      *  pixel, which matches [android.graphics.Bitmap.Config.ARGB_8888]'s in-memory buffer layout,
      *  so it can be copied straight in via `Bitmap.copyPixelsFromBuffer`. Returns null if no new

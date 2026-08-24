@@ -140,10 +140,17 @@ class InfoActivity : Activity() {
             setPadding(0, 32, 0, 0)
         }
 
+        val submitLogsButton = Button(this).apply {
+            text = "Submit Logs"
+            setPadding(0, 12, 0, 0)
+            setOnClickListener { submitLogs() }
+        }
+
         card.addView(title)
         card.addView(subtitle)
         card.addView(description)
         card.addView(openAppButton)
+        card.addView(submitLogsButton)
         card.addView(testPanel())
         card.addView(videoViewport())
         card.addView(keyboardPanel())
@@ -158,6 +165,56 @@ class InfoActivity : Activity() {
         )
 
         setContentView(ScrollView(this).apply { addView(root) })
+    }
+
+    /**
+     * Shares TWO log sources at once: this plugin's own small Kotlin-side debug log
+     * ([de.lobianco.saftssh.rustdesk.data.logging.LogFileManager] — session lifecycle,
+     * connect/disconnect, errors) AND the vendored RustDesk Rust core's own, much more detailed
+     * log — set up by `NativeBridge.initialize()` to write `.log` files into `filesDir/RustDesk/Logs`
+     * (release builds; debug builds go to logcat instead, so there is nothing to attach there).
+     * Only the most-recently-modified Rust log file is attached, not the whole directory (up to
+     * 31 daily-rotated files) — the current session is what a support case needs.
+     */
+    private fun submitLogs() {
+        runCatching {
+            val anonymized = de.lobianco.saftssh.rustdesk.data.logging.LogAnonymizer.sanitize(
+                de.lobianco.saftssh.rustdesk.data.logging.LogFileManager.logFile
+                    .takeIf { it.exists() }?.readText(Charsets.UTF_8)
+                    ?: "(no debug log found)"
+            )
+            val cacheFile = java.io.File(cacheDir, "rustdesk_plugin_debug.log").apply {
+                writeText(anonymized, Charsets.UTF_8)
+            }
+            val uris = ArrayList<android.net.Uri>().apply {
+                add(androidx.core.content.FileProvider.getUriForFile(
+                    this@InfoActivity, "$packageName.fileprovider", cacheFile
+                ))
+            }
+            val rustLogsDir = java.io.File(filesDir, "RustDesk/Logs")
+            rustLogsDir.listFiles()?.maxByOrNull { it.lastModified() }?.let { latestRustLog ->
+                val anonymizedRust = de.lobianco.saftssh.rustdesk.data.logging.LogAnonymizer.sanitize(
+                    latestRustLog.readText(Charsets.UTF_8)
+                )
+                val rustCacheFile = java.io.File(cacheDir, "rustdesk_core_${latestRustLog.name}").apply {
+                    writeText(anonymizedRust, Charsets.UTF_8)
+                }
+                uris.add(androidx.core.content.FileProvider.getUriForFile(
+                    this@InfoActivity, "$packageName.fileprovider", rustCacheFile
+                ))
+            }
+            val intent = android.content.Intent(android.content.Intent.ACTION_SEND_MULTIPLE).apply {
+                type = "text/plain"
+                putParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, uris)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                clipData = android.content.ClipData.newRawUri("", uris[0]).also { clip ->
+                    uris.drop(1).forEach { clip.addItem(android.content.ClipData.Item(it)) }
+                }
+            }
+            startActivity(android.content.Intent.createChooser(intent, "Submit Logs"))
+        }.onFailure {
+            Toast.makeText(this, "No log available to share", Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun onDestroy() {
