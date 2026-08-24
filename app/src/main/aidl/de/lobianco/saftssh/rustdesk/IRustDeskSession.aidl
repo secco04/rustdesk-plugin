@@ -102,6 +102,18 @@ interface IRustDeskSession {
     /** Current mute state. Quick synchronous native field read, same cost class as isAlive(). */
     boolean isAudioMuted();
 
+    /** Local playback volume for this session's AudioTrack, 0.0-1.0. oneway, same fire-and-forget
+     *  reasoning as setZoom/setCursorOptions. Independent of setAudioMuted — muting stops the
+     *  stream at the protocol level (disable-audio option), this only scales what's already
+     *  playing, same distinction a normal media player's mute button vs. volume slider has. */
+    oneway void setAudioVolume(float volume);
+
+    /** Current audio level for a VU-meter style UI, 0.0 (silence) to 1.0 (full scale) — RMS of the
+     *  most recently played PCM chunk, decaying towards 0 between chunks so the meter doesn't
+     *  freeze at its last value during silence. Quick synchronous field read, same cost class as
+     *  isAlive(); safe to poll frequently (e.g. every 100ms) from a UI timer. */
+    float getAudioLevel();
+
     /** Whether the connected peer advertised privacy-mode support at all (blanking the peer's own
      *  physical display while remotely controlled). Quick synchronous field read, same cost class
      *  as isAlive(). */

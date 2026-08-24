@@ -53,6 +53,10 @@ private const val BACKGROUND_NO_SURFACE_SLEEP_MS = 1_000L
 // Generous per-poll cap: at 48kHz stereo this is ~340ms of audio in one drain, far more than one
 // poll interval could ever accumulate under normal conditions — just a safety bound, not a target.
 private const val AUDIO_POLL_MAX_SAMPLES = 32_768
+// Per-poll multiplier applied to the VU-meter level when a poll finds no new samples, so a brief
+// gap between chunks fades the meter out smoothly instead of holding or snapping to empty. At the
+// 20ms poll interval this reaches near-silence (<1% of the last level) after ~260ms of no audio.
+private const val AUDIO_LEVEL_DECAY = 0.7f
 // NativeBridge.pollCursor's blob header: 4 little-endian i32 (width, height, hotx, hoty) ahead of
 // the RGBA pixels. Must match the JNI export's layout exactly.
 private const val CURSOR_HEADER_BYTES = 16
@@ -453,6 +457,15 @@ class RustDeskSessionService : Service() {
         @Volatile private var audioTrack: AudioTrack? = null
         private var audioSampleRate = 0
         private var audioChannels = 0
+        // setAudioVolume() writes this from a Binder thread and calls track.setVolume()
+        // directly if the track already exists; buildAudioTrack() (audio-poll-thread-only)
+        // reads it so a track rebuilt mid-session (format change) keeps whatever volume was set.
+        @Volatile private var audioVolume: Float = 1f
+        // VU-meter level for the "green to red" bar the Android UI shows under the camera view —
+        // RMS of the most recently played chunk, written by pumpAudio() and read from any thread
+        // via getAudioLevel(). Decays toward 0 on empty/no-track polls so a paused/silent stream
+        // doesn't leave the meter stuck at its last nonzero reading.
+        @Volatile private var audioLevel: Float = 0f
 
         private val audioPollThread = Thread({ pumpAudio() }, "RustDesk-audio-$sessionId").apply {
             isDaemon = true
@@ -498,7 +511,14 @@ class RustDeskSessionService : Service() {
                             // backpressure a blocking write to a sound device always provides).
                             runCatching { track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING) }
                                 .onFailure { AppLog.w(TAG, "pumpAudio($sessionId): AudioTrack.write failed: ${it.message}") }
+                            audioLevel = rmsLevel(samples)
+                        } else {
+                            // No new samples this poll — decay rather than snap to 0, so a brief
+                            // gap between chunks doesn't make the meter flicker to empty and back.
+                            audioLevel *= AUDIO_LEVEL_DECAY
                         }
+                    } else {
+                        audioLevel = 0f
                     }
                     Thread.sleep(AUDIO_POLL_INTERVAL_MS)
                 }
@@ -530,7 +550,19 @@ class RustDeskSessionService : Service() {
                 .setBufferSizeInBytes(minBufferSize * 4) // f32 = 4 bytes/sample
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
-                .also { it.play() }
+                .also {
+                    it.setVolume(audioVolume) // carry over whatever setAudioVolume() last set
+                    it.play()
+                }
+        }
+
+        /** RMS of one PCM chunk as a 0.0-1.0 VU-meter level. Float PCM samples are already in
+         *  [-1.0, 1.0], so RMS itself is already in range with no extra normalization — clamped
+         *  only as a guard against a stray out-of-range sample, not because it's expected. */
+        private fun rmsLevel(samples: FloatArray): Float {
+            var sumSquares = 0.0
+            for (s in samples) sumSquares += s * s
+            return kotlin.math.sqrt(sumSquares / samples.size).toFloat().coerceIn(0f, 1f)
         }
 
         /** Polls the peer's clipboard text at a much coarser interval than video (clipboard
@@ -1084,6 +1116,18 @@ class RustDeskSessionService : Service() {
         override fun isAudioMuted(): Boolean {
             if (!isCallerAuthorized()) return false
             return NativeBridge.isAudioMuted(sessionId)
+        }
+
+        override fun setAudioVolume(volume: Float) {
+            if (!isCallerAuthorized()) return
+            val clamped = volume.coerceIn(0f, 1f)
+            audioVolume = clamped
+            audioTrack?.setVolume(clamped)
+        }
+
+        override fun getAudioLevel(): Float {
+            if (!isCallerAuthorized()) return 0f
+            return audioLevel
         }
 
         override fun isPrivacyModeSupported(): Boolean {
