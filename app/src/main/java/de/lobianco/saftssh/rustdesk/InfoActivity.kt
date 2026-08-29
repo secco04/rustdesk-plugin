@@ -183,7 +183,9 @@ class InfoActivity : Activity() {
                     .takeIf { it.exists() }?.readText(Charsets.UTF_8)
                     ?: "(no debug log found)"
             )
-            val cacheFile = java.io.File(cacheDir, "rustdesk_plugin_debug.log").apply {
+            // Subdirectory, not the cache root — file_paths.xml scopes the FileProvider to it.
+            val shareDir = java.io.File(cacheDir, "shared_logs").apply { mkdirs() }
+            val cacheFile = java.io.File(shareDir, "rustdesk_plugin_debug.log").apply {
                 writeText(anonymized, Charsets.UTF_8)
             }
             val uris = ArrayList<android.net.Uri>().apply {
@@ -196,7 +198,7 @@ class InfoActivity : Activity() {
                 val anonymizedRust = de.lobianco.saftssh.rustdesk.data.logging.LogAnonymizer.sanitize(
                     latestRustLog.readText(Charsets.UTF_8)
                 )
-                val rustCacheFile = java.io.File(cacheDir, "rustdesk_core_${latestRustLog.name}").apply {
+                val rustCacheFile = java.io.File(shareDir, "rustdesk_core_${latestRustLog.name}").apply {
                     writeText(anonymizedRust, Charsets.UTF_8)
                 }
                 uris.add(androidx.core.content.FileProvider.getUriForFile(
@@ -205,6 +207,7 @@ class InfoActivity : Activity() {
             }
             val intent = android.content.Intent(android.content.Intent.ACTION_SEND_MULTIPLE).apply {
                 type = "text/plain"
+                putExtra(android.content.Intent.EXTRA_EMAIL, arrayOf("feedback@lobishell.lobianco.de"))
                 putParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, uris)
                 addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 clipData = android.content.ClipData.newRawUri("", uris[0]).also { clip ->
