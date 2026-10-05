@@ -64,8 +64,15 @@ class InfoActivity : Activity() {
     @Volatile private var renderOffsetX = 0f
     @Volatile private var renderOffsetY = 0f
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        PluginPermissionRequest.onResult(this, requestCode, permissions, grantResults)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Notifications + (Android 17+) local-network access — see PluginPermissionRequest.
+        if (PluginPermissionRequest.onCreate(this)) return
         NativeBridge.initialize(filesDir.absolutePath)
 
         val root = LinearLayout(this).apply {

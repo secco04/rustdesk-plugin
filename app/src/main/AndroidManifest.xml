@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 17+: required to reach hosts on the local network at all (runtime permission, asked in InfoActivity). -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
 
     <!-- Needed to keep a session alive while both apps are backgrounded — same reasoning as the
          Linux Plugin's LinuxSessionService.startForeground / Remote Desktop Plugin's equivalent. -->
