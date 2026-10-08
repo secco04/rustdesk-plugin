@@ -83,6 +83,13 @@ private const val HOST_CURSOR_BASE_SCALE = 2.0f
 // retries at the 16ms cadence) comfortably outlasts a resize settle while still escalating for a
 // real persistent failure well within a second.
 private const val BLIT_FAILURE_ESCALATION_THRESHOLD = 60
+// The backoff exists only for a display that is OFF (task #43). A display that is off can't be
+// receiving touches or resizing its layout — so within this window after any user input or Surface
+// resize, failures are always the transient BufferQueue-resize kind and must never trip the 2s
+// backoff. Without this, moving the mouse while the IME animated in doubled the failure rate
+// (pumpVideo's retry + sendMouse's own redraw both counting), hit the threshold in ~0.5s and froze
+// the picture for BLIT_RETRY_INTERVAL_MS — reported as "picture hangs 1-2s, mostly with the IME".
+private const val BLIT_BACKOFF_ACTIVITY_GRACE_MS = 3000L
 // File-transfer events (dir listings, job progress/done/error, overwrite prompts) are far rarer
 // than video frames — no need to poll anywhere near that often.
 private const val FILE_TRANSFER_POLL_INTERVAL_MS = 250L
@@ -126,6 +133,8 @@ class RustDeskSessionService : Service() {
     override fun onCreate() {
         super.onCreate()
         NativeBridge.initialize(filesDir.absolutePath)
+        // Which RustDesk core this plugin build bundles — first thing to check in a user's log.
+        runCatching { AppLog.i(TAG, "RustDesk core ${NativeBridge.coreVersion()}") }
     }
 
     override fun onBind(intent: Intent?): IBinder = serviceStub
@@ -394,6 +403,8 @@ class RustDeskSessionService : Service() {
         // Escalating only after several consecutive failures keeps the real display-off protection
         // (task #43) while no longer punishing a one-off resize-induced miss.
         @Volatile private var consecutiveBlitFailures = 0
+        // Last user input / Surface resize — see BLIT_BACKOFF_ACTIVITY_GRACE_MS.
+        @Volatile private var lastActivityMs = 0L
         // Set when a resize's immediate redraw (see updateSurface) couldn't land because the
         // just-resized BufferQueue transiently rejected the buffer — makes pumpVideo re-attempt the
         // redraw of the last frame on its idle (no-new-frame) path until it succeeds, so a STATIC
@@ -960,12 +971,25 @@ class RustDeskSessionService : Service() {
          *  own next frame and shouldn't cost a multi-second stall). */
         private fun registerBlitFailure() {
             consecutiveBlitFailures++
-            blitFailing = consecutiveBlitFailures >= BLIT_FAILURE_ESCALATION_THRESHOLD
+            val wasFailing = blitFailing
+            blitFailing = consecutiveBlitFailures >= BLIT_FAILURE_ESCALATION_THRESHOLD &&
+                System.currentTimeMillis() - lastActivityMs > BLIT_BACKOFF_ACTIVITY_GRACE_MS
+            if (blitFailing && !wasFailing) {
+                AppLog.w(TAG, "blitToSurface($sessionId): $consecutiveBlitFailures failures in a row with no recent input — backing off to one attempt per ${BLIT_RETRY_INTERVAL_MS}ms")
+            }
+        }
+
+        /** User input or a Surface resize: the display is evidently on, so any blit failure now is
+         *  transient — lift a running backoff immediately (see BLIT_BACKOFF_ACTIVITY_GRACE_MS). */
+        private fun noteActivity() {
+            lastActivityMs = System.currentTimeMillis()
+            blitFailing = false
         }
 
         override fun updateSurface(newSurface: Surface?) {
             if (!isCallerAuthorized()) return
             surface = newSurface
+            noteActivity()
             // A genuinely new Surface deserves an immediate retry, not the backoff interval left
             // over from the old one failing (e.g. display was off, screen just came back on with
             // a fresh Surface after the app resumed) — same reasoning as VncClient's identical fix.
@@ -1008,6 +1032,7 @@ class RustDeskSessionService : Service() {
             if (!isCallerAuthorized()) return
             // "wheel" carries a notch delta in x/y (see NativeBridge.sendMouse's doc), not a real
             // position — don't let it teleport the synthetic cursor to (0, ±1).
+            noteActivity()
             if (mouseType != "wheel") {
                 pointerFbX = x
                 pointerFbY = y
@@ -1022,6 +1047,7 @@ class RustDeskSessionService : Service() {
 
         override fun setZoom(scale: Float, panXValue: Float, panYValue: Float) {
             if (!isCallerAuthorized()) return
+            noteActivity()
             zoomScale = scale.coerceAtLeast(0.1f)
             panX = panXValue
             panY = panYValue

@@ -26,3 +26,12 @@ scrap = { path = "../rustdesk-upstream/libs/scrap" }
 # pinned in rustdesk-upstream's Cargo.lock (which we copy in before every build), so this adds no
 # new dependency version to resolve.
 serde_json = "1"
+
+# rustdesk-upstream's own [patch.crates-io] only takes effect in the workspace ROOT manifest — which,
+# for this build, is this file. Mirror the entries the Android build actually uses (1.5.0 relies on
+# rustdesk-org's webrtc fork for SettingEngine/SCTP APIs the crates.io release lacks).
+[patch.crates-io]
+tungstenite = { git = "https://github.com/rustdesk-org/tungstenite-rs", rev = "efce47e5364f00a63302cf07ab1fb13ded478914" }
+webrtc = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
+webrtc-util = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
+webrtc-sctp = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }

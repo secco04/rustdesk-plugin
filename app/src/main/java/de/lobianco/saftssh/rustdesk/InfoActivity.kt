@@ -101,7 +101,7 @@ class InfoActivity : Activity() {
         }
 
         val subtitle = TextView(this).apply {
-            text = "RustDesk remote desktop engine (AGPL-3.0)"
+            text = "RustDesk ${runCatching { NativeBridge.coreVersion() }.getOrDefault("?")} remote desktop engine (AGPL-3.0)"
             textSize = 15f
             gravity = Gravity.CENTER
             setTextColor(Color.rgb(170, 180, 200))
