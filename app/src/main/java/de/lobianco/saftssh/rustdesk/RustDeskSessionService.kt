@@ -29,6 +29,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.locks.LockSupport
 import org.json.JSONObject
 
 private const val TAG = "RustDeskSessionService"
@@ -325,6 +326,12 @@ class RustDeskSessionService : Service() {
         // blitToSurface, distinct from blitToSurface's own one-shot "first frame drawn" log which
         // can fire on a blank pre-decode bitmap.
         private var realFrameCount = 0
+        // Blit timing since the last "real frame" log line (lock wait + draw + post) — so a report
+        // of a sluggish picture can be told apart: slow drawing vs. frames simply not arriving.
+        private var statBlitCount = 0
+        private var statPartialCount = 0
+        private var statBlitNanos = 0L
+        private var statBlitMaxNanos = 0L
         private var lastRealFrameLogMs = 0L
         // elapsedRealtime() of the most recent REAL decoded frame (same qualifying condition as
         // realFrameCount above — frame.size matched the bitmap, so this is never set by a blank
@@ -381,6 +388,33 @@ class RustDeskSessionService : Service() {
         // thread's own redraws for the same Surface lock. Sharing one timestamp between both call
         // sites caps their COMBINED rate instead of each getting its own independent 60fps budget.
         @Volatile private var lastExtraBlitMs = 0L
+        // Set by sendMouse/setZoom/setCursorOptions: "the cursor or zoom changed, draw again".
+        // They used to blit INLINE, on the Binder thread. Oneway calls to one binder are delivered
+        // strictly one after another, so whenever a blit took longer than the gap between two
+        // mouse moves (a full-height Surface, i.e. keyboard CLOSED — roughly twice the pixels of
+        // the IME-shrunk one) the moves queued up behind it and the pointer lagged ever further
+        // behind the finger, the remote pointer included (NativeBridge.sendMouse ran after the
+        // blit). Now they only flag it and wake pumpVideo, which draws once for any number of
+        // moves since its last pass.
+        @Volatile private var redrawRequested = false
+        // Like redrawRequested, but only the pointer moved (sendMouse): pumpVideo then redraws just
+        // the small area around the old and new pointer (see blitToSurface's cursorOnly) instead
+        // of the whole Surface - a full software redraw of a 1440x2574 Surface per mouse move was
+        // what made the pointer sluggish with the keyboard closed (half that area with it open).
+        @Volatile private var cursorRedrawRequested = false
+        // Surface pixels the pointer occupied in the last blit - the part a pointer-only redraw
+        // must repaint. Null = unknown (forces a full redraw). Guarded by renderLock.
+        private var lastCursorRect: android.graphics.Rect? = null
+        // How the CURRENT Surface object is drawn: 0 = not decided yet, 1 = GPU
+        // (lockHardwareCanvas), 2 = CPU (lockCanvas). One Surface object can only ever be connected
+        // with one of the two, so the choice is per object and reset by updateSurface. GPU is tried
+        // first: zoomed in on a full-height Surface (keyboard closed) every video frame scaled the
+        // 2560x1440 picture onto all 1440x2574 pixels in SOFTWARE — the reported "picture is
+        // sluggish, only zoomed, only with the keyboard closed". CPU stays as the fallback for a
+        // Surface the GPU path can't take. Guarded by renderLock.
+        private var canvasMode = 0
+        // Bilinear filtering for the GPU path (free there; on the CPU path it would cost extra).
+        private val gpuBitmapPaint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
         // Same fix as VncClient's identical problem (task #43): turning the DISPLAY off (not
         // backgrounding the app) does NOT invalidate/reallocate the SurfaceView's Surface — so
         // `surface.isValid` stays true and lockCanvas() itself is what starts failing natively
@@ -430,6 +464,12 @@ class RustDeskSessionService : Service() {
         // isn't designed for concurrent calls from multiple threads at once, and letting them race
         // was plausibly adding to the reported cursor lag on top of the throttling fix above.
         private val renderLock = Any()
+        /** See [redrawRequested]. Cheap and non-blocking — safe on Binder threads. */
+        private fun requestRedraw(cursorOnly: Boolean = false) {
+            if (cursorOnly) cursorRedrawRequested = true else redrawRequested = true
+            LockSupport.unpark(videoThread)
+        }
+
         private val videoThread = Thread({ pumpVideo() }, "RustDesk-video-$sessionId").apply {
             isDaemon = true
             start()
@@ -661,14 +701,21 @@ class RustDeskSessionService : Service() {
                         // any input.
                         if (pendingResizeRedraw) {
                             pendingResizeRedraw = currentBitmap?.let { !blitToSurface(it) } ?: false
-                        } else if (cursorChanged) {
+                        } else if (cursorChanged || redrawRequested || cursorRedrawRequested) {
                             // A new cursor shape with no new frame (static screen) still has to be
                             // drawn, or the I-beam/resize arrow wouldn't appear until something else
-                            // happened to trigger a redraw.
-                            currentBitmap?.let { blitToSurface(it) }
+                            // happened to trigger a redraw. Same for a moved pointer / changed zoom
+                            // (redrawRequested, see its doc).
+                            val full = redrawRequested
+                            redrawRequested = false
+                            cursorRedrawRequested = false
+                            currentBitmap?.let { blitToSurface(it, cursorOnly = !full) }
                         }
                         logVideoStallIfSilent(display, "no decoded frame available")
-                        Thread.sleep(16)
+                        // Not Thread.sleep: requestRedraw() unparks this early, so a mouse move is
+                        // drawn right away instead of after up to 16ms. A spurious early wake-up
+                        // just means one extra cheap poll.
+                        if (!redrawRequested && !cursorRedrawRequested) LockSupport.parkNanos(16_000_000L)
                         continue
                     }
                     // The frame buffer's length is the DECODED VIDEO's own w*h*4 (upstream
@@ -691,6 +738,8 @@ class RustDeskSessionService : Service() {
                         continue
                     }
                     bmp.copyPixelsFromBuffer(ByteBuffer.wrap(frame))
+                    redrawRequested = false   // this blit draws the current pointer/zoom too
+                    cursorRedrawRequested = false
                     val blitOk = blitToSurface(bmp)
                     // Distinguishes "decoder never hands us real pixels" from "we get real pixels
                     // but they don't end up on screen" — a case report showed a fully clean log
@@ -707,7 +756,16 @@ class RustDeskSessionService : Service() {
                     val now = System.currentTimeMillis()
                     if (realFrameCount == 1 || now - lastRealFrameLogMs >= REAL_FRAME_LOG_INTERVAL_MS) {
                         lastRealFrameLogMs = now
-                        AppLog.i(TAG, "pumpVideo($sessionId): real frame #$realFrameCount decoded+copied, blitToSurface=$blitOk")
+                        val stats = synchronized(renderLock) {
+                            val n = statBlitCount
+                            val avgMs = if (n > 0) statBlitNanos / n / 1_000_000.0 else 0.0
+                            val line = "blits=$n (pointer-only=$statPartialCount) avg=${"%.1f".format(avgMs)}ms " +
+                                "max=${statBlitMaxNanos / 1_000_000}ms canvas=${lastLoggedCanvasW}x$lastLoggedCanvasH " +
+                                "mode=${when (canvasMode) { 1 -> "gpu"; 2 -> "cpu"; else -> "?" }}"
+                            statBlitCount = 0; statPartialCount = 0; statBlitNanos = 0L; statBlitMaxNanos = 0L
+                            line
+                        }
+                        AppLog.i(TAG, "pumpVideo($sessionId): real frame #$realFrameCount decoded+copied, blitToSurface=$blitOk, $stats")
                     }
                     firstFrameSeen = true
                 }
@@ -840,7 +898,42 @@ class RustDeskSessionService : Service() {
          *  CURRENT canvas size every call) times the pinch-zoom transform. Returns true only if the
          *  frame actually reached the Surface — updateSurface / pumpVideo use that to know whether a
          *  post-resize redraw landed or still needs retrying (see pendingResizeRedraw). */
-        private fun blitToSurface(bitmap: Bitmap): Boolean {
+        /** Where the pointer lands on a [sw]x[sh] canvas for [bitmap] - exactly blitToSurface's own
+         *  geometry and cursor-mode rules, padded for the outline and anti-aliasing. Null when no
+         *  pointer is drawn. */
+        private fun cursorRectFor(sw: Float, sh: Float, bitmap: Bitmap): android.graphics.Rect? {
+            if (pointerFbX < 0 || pointerFbY < 0 || bitmap.width <= 0 || bitmap.height <= 0) return null
+            val scale = minOf(sw / bitmap.width, sh / bitmap.height) * zoomScale
+            val ox = (sw - bitmap.width * scale) / 2f + panX
+            val oy = panY
+            val cx = ox + pointerFbX * scale
+            val cy = oy + pointerFbY * scale
+            val r = RectF()
+            val host = hostCursorBitmap
+            val drawHost = host != null && (cursorMode == "host" || cursorMode == "both")
+            if (host != null && drawHost) {
+                val cs = HOST_CURSOR_BASE_SCALE * cursorSizeScale
+                val left = cx - hostCursorHotX * cs
+                val top = cy - hostCursorHotY * cs
+                r.union(left, top, left + host.width * cs, top + host.height * cs)
+            }
+            if (cursorMode == "local" || cursorMode == "both" || !drawHost) {
+                // SyntheticCursor's arrow spans 11 x 19 units of its BASE (2.4) * sizeScale.
+                val u = 2.4f * cursorSizeScale
+                r.union(cx, cy, cx + 11f * u, cy + 19f * u)
+            }
+            if (r.isEmpty) return null
+            val pad = 6
+            return android.graphics.Rect(
+                kotlin.math.floor(r.left).toInt() - pad, kotlin.math.floor(r.top).toInt() - pad,
+                kotlin.math.ceil(r.right).toInt() + pad, kotlin.math.ceil(r.bottom).toInt() + pad
+            )
+        }
+
+        /** [cursorOnly] = only the pointer moved: lock and repaint just the old+new pointer area
+         *  (the Surface copies the rest of the previous frame back) instead of the whole canvas.
+         *  Falls back to a full redraw whenever that area isn't known. */
+        private fun blitToSurface(bitmap: Bitmap, cursorOnly: Boolean = false): Boolean {
             val s = surface ?: run {
                 AppLog.w(TAG, "blitToSurface($sessionId): no surface set yet — nothing to draw onto")
                 return false
@@ -856,15 +949,52 @@ class RustDeskSessionService : Service() {
             // as dst=null in the catch block's log, distinguishable from a throw after dst was set.
             lastBlitScale = null
             lastBlitDst = null
+            val blitStart = System.nanoTime()
             try {
                 // Serializes against the OTHER threads that can call this concurrently (video-pump
                 // thread vs. Binder threadpool threads via sendMouse/setZoom) — Surface.lockCanvas()
                 // isn't meant to be raced from multiple threads at once; see renderLock's doc.
                 synchronized(renderLock) {
-                    val canvas: Canvas = s.lockCanvas(null) ?: run {
-                        AppLog.w(TAG, "blitToSurface($sessionId): lockCanvas() returned null")
-                        registerBlitFailure()
-                        return false
+                    // updateSurface swapped (and released) the Surface since we read it.
+                    if (s !== surface) return false
+                    val dirty: android.graphics.Rect? = if (cursorOnly) {
+                        val prev = lastCursorRect
+                        val next = if (lastLoggedCanvasW > 0 && lastLoggedCanvasH > 0)
+                            cursorRectFor(lastLoggedCanvasW.toFloat(), lastLoggedCanvasH.toFloat(), bitmap) else null
+                        if (prev != null && next != null) android.graphics.Rect(prev).apply { union(next) } else null
+                    } else null
+                    val canvas: Canvas = if (canvasMode == 2) {
+                        s.lockCanvas(dirty) ?: run {
+                            AppLog.w(TAG, "blitToSurface($sessionId): lockCanvas() returned null")
+                            registerBlitFailure()
+                            return false
+                        }
+                    } else {
+                        try {
+                            s.lockHardwareCanvas().also {
+                                if (canvasMode == 0) AppLog.i(TAG, "blitToSurface($sessionId): drawing on the GPU")
+                                canvasMode = 1
+                            }
+                        } catch (e: Exception) {
+                            // Only the very first attempt on a Surface decides; once the GPU path
+                            // has worked, a later failure is a transient one (resize) and is
+                            // reported like any other.
+                            if (canvasMode != 0) throw e
+                            canvasMode = 2
+                            AppLog.w(TAG, "blitToSurface($sessionId): GPU canvas unavailable (${e.message}) — drawing on the CPU")
+                            try {
+                                s.lockCanvas(dirty) ?: run {
+                                    canvasMode = 0
+                                    registerBlitFailure()
+                                    return false
+                                }
+                            } catch (cpu: Exception) {
+                                // Neither worked: the Surface just isn't ready yet (transient) -
+                                // decide again on the next attempt instead of pinning the CPU path.
+                                canvasMode = 0
+                                throw cpu
+                            }
+                        }
                     }
                     try {
                         val sw = canvas.width.toFloat()
@@ -895,8 +1025,14 @@ class RustDeskSessionService : Service() {
                         // instance (not just a local) so the catch block below can still read the
                         // exact values that were live at throw time.
                         lastBlitScale = scale; lastBlitDst = dst
+                        // Black only AROUND the picture: filling the whole canvas first and then
+                        // painting the picture over most of it doubled the pixel work per frame on a
+                        // full-height (keyboard closed) Surface.
+                        canvas.save()
+                        canvas.clipOutRect(dst)
                         canvas.drawColor(Color.BLACK)
-                        canvas.drawBitmap(bitmap, null, dst, null)
+                        canvas.restore()
+                        canvas.drawBitmap(bitmap, null, dst, if (canvasMode == 1) gpuBitmapPaint else null)
                         if (pointerFbX >= 0 && pointerFbY >= 0) {
                             val cx = ox + pointerFbX * scale
                             val cy = oy + pointerFbY * scale
@@ -927,6 +1063,7 @@ class RustDeskSessionService : Service() {
                                 SyntheticCursor.draw(canvas, cx, cy, cursorSizeScale)
                             }
                         }
+                        lastCursorRect = cursorRectFor(sw, sh, bitmap)
                         if (!loggedFirstBlit) {
                             loggedFirstBlit = true
                             AppLog.i(TAG, "blitToSurface($sessionId): first frame drawn, canvas=${sw}x$sh bitmap=${bitmap.width}x${bitmap.height}")
@@ -936,6 +1073,13 @@ class RustDeskSessionService : Service() {
                     }
                 }
                 consecutiveBlitFailures = 0
+                val took = System.nanoTime() - blitStart
+                synchronized(renderLock) {
+                    statBlitCount++
+                    if (cursorOnly) statPartialCount++
+                    statBlitNanos += took
+                    if (took > statBlitMaxNanos) statBlitMaxNanos = took
+                }
                 blitFailing = false
                 return true
             } catch (e: Exception) {
@@ -944,6 +1088,7 @@ class RustDeskSessionService : Service() {
                 // parceled cross-process Surface never actually becoming usable) is visible instead
                 // of silently showing a black view forever with no trace in logcat.
                 registerBlitFailure()
+                synchronized(renderLock) { lastCursorRect = null }   // unknown what is on screen now - next redraw is full
                 blitFailLogCount++
                 if (blitFailLogCount <= 5 || blitFailLogCount % 50 == 0) {
                     // Full stack trace (not just e.message) — on the OEM Canvas seen in the field
@@ -988,7 +1133,20 @@ class RustDeskSessionService : Service() {
 
         override fun updateSurface(newSurface: Surface?) {
             if (!isCallerAuthorized()) return
-            surface = newSurface
+            // Every call brings a NEW Surface object (unparcelled from Binder) - one per resize
+            // step of an IME/key-bar animation. The old one was never released: it stayed
+            // connected to the BufferQueue, so locking the new one failed ("connect: already
+            // connected", IllegalArgumentException from lockCanvas) until the garbage collector
+            // happened to finalize the old one ("A resource failed to call Surface.release") -
+            // thousands of failed blits per session. Release it under renderLock, so no blit is
+            // using it at that moment (blitToSurface re-checks `surface` inside the lock).
+            synchronized(renderLock) {
+                val old = surface
+                surface = newSurface
+                lastCursorRect = null   // new buffer - nothing to copy back, redraw fully once
+                canvasMode = 0          // decide GPU vs. CPU afresh for the new Surface object
+                if (old != null && old !== newSurface) runCatching { old.release() }
+            }
             noteActivity()
             // A genuinely new Surface deserves an immediate retry, not the backoff interval left
             // over from the old one failing (e.g. display was off, screen just came back on with
@@ -1036,13 +1194,11 @@ class RustDeskSessionService : Service() {
             if (mouseType != "wheel") {
                 pointerFbX = x
                 pointerFbY = y
-                val now = System.currentTimeMillis()
-                if (now - lastExtraBlitMs >= 16L) {
-                    lastExtraBlitMs = now
-                    currentBitmap?.let { blitToSurface(it) }
-                }
             }
+            // The host first, then the local redraw happens on the video thread — see
+            // redrawRequested's doc for why this must not blit here.
             NativeBridge.sendMouse(sessionId, x, y, mouseType.orEmpty(), buttons.orEmpty())
+            if (mouseType != "wheel") requestRedraw(cursorOnly = true)
         }
 
         override fun setZoom(scale: Float, panXValue: Float, panYValue: Float) {
@@ -1051,14 +1207,8 @@ class RustDeskSessionService : Service() {
             zoomScale = scale.coerceAtLeast(0.1f)
             panX = panXValue
             panY = panYValue
-            // Throttled the same as sendMouse's cursor-redraw (shared lastExtraBlitMs) — this used
-            // to redraw unconditionally on every call, which is what made edge-panning (called on
-            // every touch-move sample while zoomed) visibly lag: see lastExtraBlitMs's doc.
-            val now = System.currentTimeMillis()
-            if (now - lastExtraBlitMs >= 16L) {
-                lastExtraBlitMs = now
-                currentBitmap?.let { blitToSurface(it) }
-            }
+            // Drawn by the video thread, coalesced with pointer moves — see redrawRequested.
+            requestRedraw()
         }
 
         override fun inputKey(name: String?, down: Boolean, press: Boolean, ctrl: Boolean, alt: Boolean, shift: Boolean) {
@@ -1132,7 +1282,7 @@ class RustDeskSessionService : Service() {
             // Pure render state — redraw the last frame immediately so the change is visible at
             // once, rather than only on the next server frame (a static remote screen sends none;
             // same reasoning as updateSurface's redraw).
-            currentBitmap?.let { blitToSurface(it) }
+            requestRedraw()
         }
 
         override fun setAudioMuted(muted: Boolean) {
@@ -1201,7 +1351,10 @@ class RustDeskSessionService : Service() {
             clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
             audioTrack?.let { runCatching { it.stop(); it.release() } }
             audioTrack = null
-            surface = null
+            synchronized(renderLock) {
+                surface?.let { runCatching { it.release() } }
+                surface = null
+            }
             NativeBridge.disconnect(sessionId)
             openSessions.remove(this)
             demoteFromForegroundIfIdle()
