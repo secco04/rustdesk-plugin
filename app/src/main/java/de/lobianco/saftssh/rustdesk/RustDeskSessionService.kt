@@ -33,6 +33,9 @@ import java.util.concurrent.locks.LockSupport
 import org.json.JSONObject
 
 private const val TAG = "RustDeskSessionService"
+/** onDisconnected reason for a session the core refused for not being end-to-end encrypted.
+ *  The main app (RustDeskSessionHolder) matches this exact string — keep both in sync. */
+private const val INSECURE_CONNECTION_REFUSED = "insecure-connection-refused"
 private const val NOTIF_CHANNEL_ID = "rustdesk_session"
 private const val NOTIF_ID = 3001
 // blitToSurface() rate-limit when the Surface can't be locked (e.g. display off) — see that
@@ -663,6 +666,9 @@ class RustDeskSessionService : Service() {
                     val bmp = currentBitmap ?: run {
                         val size = NativeBridge.getDisplaySize(sessionId, display)
                         if (size == null || size.size != 2 || size[0] <= 0 || size[1] <= 0) {
+                            // Still waiting for the first picture — or for nothing, if the core
+                            // already refused the session as not end-to-end encrypted.
+                            if (refusedAsInsecure()) return
                             logVideoStallIfSilent(display, "no display size from peer yet")
                             Thread.sleep(200)
                             return@run null
@@ -1250,7 +1256,29 @@ class RustDeskSessionService : Service() {
 
         override fun getQualityStatus(): String? {
             if (!isCallerAuthorized()) return null
-            return NativeBridge.pollQualityStatus(sessionId)
+            val quality = NativeBridge.pollQualityStatus(sessionId) ?: return null
+            // The connection's security (`secure`/`direct`) rides along in the same JSON, so the
+            // app learns it without a new AIDL method — an older app simply ignores the keys.
+            val security = NativeBridge.pollConnectionSecurity(sessionId) ?: return quality
+            return runCatching {
+                val merged = JSONObject(quality)
+                val sec = JSONObject(security)
+                sec.keys().forEach { merged.put(it, sec.get(it)) }
+                merged.toString()
+            }.getOrDefault(quality)
+        }
+
+        /** True (and reported to the app once, via onDisconnected) when the core refused this
+         *  session for not being end-to-end encrypted — see NativeBridge.pollConnectionSecurity.
+         *  Without this check the session just waited for a first frame that never comes. */
+        private fun refusedAsInsecure(): Boolean {
+            val json = NativeBridge.pollConnectionSecurity(sessionId) ?: return false
+            val refused = runCatching { JSONObject(json).optBoolean("insecure_rejected") }.getOrDefault(false)
+            if (!refused) return false
+            AppLog.w(TAG, "Session $sessionId refused: not end-to-end encrypted (peer key could not be verified)")
+            running = false
+            runCatching { callback?.onDisconnected(INSECURE_CONNECTION_REFUSED) }
+            return true
         }
 
         override fun switchDisplay(display: Int) {

@@ -27,9 +27,9 @@ object NativeBridge {
      *  from multiple entry points in this process) — guarded by a Rust-side Once internally. */
     external fun initialize(filesDir: String)
 
-    /** Self-hosted rendezvous/relay/API server + its public key. Empty string = leave that
-     *  setting untouched. Call before [connect] to use a custom server instead of RustDesk's
-     *  public default. */
+    /** Rendezvous/relay/API server + its public key for the next [connect]. Empty string = that
+     *  setting back to RustDesk's public default — every call replaces all four, so one
+     *  connection's custom server can no longer leak into the next. */
     external fun setServerConfig(idServer: String, relayServer: String, apiServer: String, key: String)
 
     /** Returns a session id (UUID string) on success, or "ERR:<message>" on failure. */
@@ -117,6 +117,12 @@ object NativeBridge {
     /** Latest known connection stats (speed/fps/delay/target_bitrate/codec_format) as a JSON
      *  string — see IRustDeskSession.getQualityStatus's doc for the exact shape. */
     external fun pollQualityStatus(sessionId: String): String?
+
+    /** Whether the session is end-to-end encrypted, as JSON
+     *  (`{"secure":false,"direct":true,"insecure_rejected":false}`, `"{}"` before the handshake).
+     *  `insecure_rejected` = the core refused a session through an ID server whose peer key could
+     *  not be verified; it will never produce a picture. */
+    external fun pollConnectionSecurity(sessionId: String): String?
 
     /** Switches which single display (0-based) this session captures/views — fire-and-forget; the
      *  new display's size/first frame arrive through the normal getDisplaySize/getFrame polling. */

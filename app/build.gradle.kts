@@ -29,8 +29,8 @@ android {
         applicationId = "de.lobianco.saftssh.rustdesk"
         minSdk = 26
         targetSdk = 37
-        versionCode = 19
-        versionName = "0.19"
+        versionCode = 20
+        versionName = "0.20"
     }
 
     buildFeatures {
@@ -88,6 +88,6 @@ kotlin {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.19.0")
-    implementation("androidx.appcompat:appcompat:1.7.1")
+    implementation("androidx.core:core-ktx:1.19.1")
+    implementation("androidx.appcompat:appcompat:1.8.0")
 }

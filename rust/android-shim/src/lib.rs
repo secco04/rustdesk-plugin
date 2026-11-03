@@ -80,11 +80,12 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_coreVersio
     })
 }
 
-/// Sets a self-hosted rendezvous/relay/API server + its public key. Same option keys RustDesk's
-/// own Settings > Network screen uses internally (`main_set_option` under the hood) — empty
-/// strings leave that particular setting untouched (so passing "" for all four just uses whatever
-/// was set before, or RustDesk's own public default servers if nothing was ever set). Call this
-/// once before `connect` if you want a custom server instead of the public default.
+/// Sets the rendezvous/relay/API server + its public key for the next `connect`. Same option keys
+/// RustDesk's own Settings > Network screen uses internally (`main_set_option` under the hood).
+/// Every call sets all four: an empty string clears that option back to RustDesk's own default.
+/// Empty strings used to leave the previous value untouched, so a connection meant for the public
+/// servers silently went through whatever custom server (and key) an earlier connection had set —
+/// a hostile one could then broker, or with a stale key downgrade, every later session.
 #[no_mangle]
 pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_setServerConfig<'local>(
     mut env: JNIEnv<'local>,
@@ -100,18 +101,10 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_setServerC
         let api_server: String = env.get_string(&api_server).map(|s| s.into()).unwrap_or_default();
         let key: String = env.get_string(&key).map(|s| s.into()).unwrap_or_default();
 
-        if !id_server.is_empty() {
-            librustdesk::flutter_ffi::main_set_option("custom-rendezvous-server".to_string(), id_server);
-        }
-        if !relay_server.is_empty() {
-            librustdesk::flutter_ffi::main_set_option("relay-server".to_string(), relay_server);
-        }
-        if !api_server.is_empty() {
-            librustdesk::flutter_ffi::main_set_option("api-server".to_string(), api_server);
-        }
-        if !key.is_empty() {
-            librustdesk::flutter_ffi::main_set_option("key".to_string(), key);
-        }
+        librustdesk::flutter_ffi::main_set_option("custom-rendezvous-server".to_string(), id_server);
+        librustdesk::flutter_ffi::main_set_option("relay-server".to_string(), relay_server);
+        librustdesk::flutter_ffi::main_set_option("api-server".to_string(), api_server);
+        librustdesk::flutter_ffi::main_set_option("key".to_string(), key);
     })
 }
 
@@ -488,6 +481,31 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollQualit
             return std::ptr::null_mut();
         }
         let json = librustdesk::flutter::take_headless_quality_status();
+        env.new_string(json)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Whether the session is end-to-end encrypted, as JSON — see
+/// `librustdesk::flutter::headless_connection_security`'s doc for the shape. `"{}"` until the
+/// handshake is done; `insecure_rejected` means the core refused the session (an ID-server
+/// connection whose peer key could not be verified) and it will never produce a picture.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollConnectionSecurity<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jstring {
+    guard(std::ptr::null_mut(), move || {
+        let session_id_str: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id_str) else {
+            return std::ptr::null_mut();
+        };
+        let json = librustdesk::flutter::headless_connection_security(&session_id);
         env.new_string(json)
             .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut())
