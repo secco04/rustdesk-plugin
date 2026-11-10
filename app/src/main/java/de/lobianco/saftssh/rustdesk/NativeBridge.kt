@@ -60,6 +60,18 @@ object NativeBridge {
      *  See IRustDeskSession.aidl's doc for why this isn't yet a proper connect/fail signal. */
     external fun isAlive(sessionId: String): Boolean
 
+    /** Where the core's connection stands: [CONN_STATE_CONNECTING], [CONN_STATE_CONNECTED],
+     *  [CONN_STATE_DISCONNECTED] (its io_loop ended — peer reset, network error such as a Wi-Fi ↔
+     *  mobile switch, 30s receive timeout) or [CONN_STATE_GONE] (no such session). The only way
+     *  the plugin learns about a mid-session drop: the core reports it through a msgbox, which a
+     *  headless session never sees. */
+    external fun connectionState(sessionId: String): Int
+
+    const val CONN_STATE_GONE = -1
+    const val CONN_STATE_CONNECTING = 0
+    const val CONN_STATE_CONNECTED = 1
+    const val CONN_STATE_DISCONNECTED = 2
+
     /** [width, height] for `display`, or null if not known yet (poll again shortly — e.g. before
      *  the peer handshake completes). */
     external fun getDisplaySize(sessionId: String, display: Int): IntArray?

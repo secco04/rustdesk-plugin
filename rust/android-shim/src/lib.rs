@@ -512,6 +512,28 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_pollConnec
     })
 }
 
+/// Where the session's connection stands: 0 connecting, 1 connected, 2 disconnected (the core's
+/// io_loop ended — peer reset, network error, receive timeout), -1 no such session. See
+/// `librustdesk::flutter::headless_connection_state`. This is the "sync connection-state getter"
+/// `isAlive`'s doc calls an open item: without it a dropped connection was invisible here.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connectionState<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jint {
+    guard(-1, move || {
+        let session_id_str: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id_str) else {
+            return -1;
+        };
+        librustdesk::flutter::headless_connection_state(&session_id)
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // Audio (plans/soft-frolicking-thimble.md, "Audio" round): playback. `AudioHandler` (client.rs)
 // decodes each incoming frame on its own dedicated thread — already headless-safe, no push_event

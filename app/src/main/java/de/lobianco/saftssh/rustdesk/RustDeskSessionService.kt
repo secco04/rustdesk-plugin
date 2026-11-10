@@ -36,6 +36,11 @@ private const val TAG = "RustDeskSessionService"
 /** onDisconnected reason for a session the core refused for not being end-to-end encrypted.
  *  The main app (RustDeskSessionHolder) matches this exact string — keep both in sync. */
 private const val INSECURE_CONNECTION_REFUSED = "insecure-connection-refused"
+/** onDisconnected reason for a connection that dropped mid-session (see connectionLost). The main
+ *  app (RustDeskSessionHolder) matches this exact string to show its own text — keep both in sync. */
+private const val CONNECTION_LOST = "connection-lost"
+/** How often pumpVideo asks the core whether the connection is still up — see connectionLost. */
+private const val CONN_STATE_CHECK_INTERVAL_MS = 1_000L
 private const val NOTIF_CHANNEL_ID = "rustdesk_session"
 private const val NOTIF_ID = 3001
 // blitToSurface() rate-limit when the Surface can't be locked (e.g. display off) — see that
@@ -347,6 +352,11 @@ class RustDeskSessionService : Service() {
         // no onDisconnected ever firing since the socket doesn't error out).
         @Volatile private var lastRealFrameAtMs = 0L
 
+        // Mid-session drop detection — see connectionLost. announcedConnected flips in
+        // allocateBitmap (= onConnected fired); lastConnStateCheckMs is pump-thread only.
+        @Volatile private var announcedConnected = false
+        private var lastConnStateCheckMs = 0L
+
         // Pinch-zoom transform (see setZoom / IRustDeskSession.setZoom). scale is relative to the
         // base letterbox fit; panX/panY are Surface-local pixel offsets. RustDeskScreen owns these
         // and mirrors the same transform in its touch inverse-map.
@@ -642,14 +652,15 @@ class RustDeskSessionService : Service() {
 
         /** Same poll-and-blit loop as InfoActivity's test-harness startVideo/blitToSurface, moved
          *  here so a real caller (the main app, via updateSurface) gets the same video path the
-         *  test panel already validated on-device. NOTE: there is no push-based "peer disconnected"
-         *  signal available (see session_start_headless's doc) — onDisconnected is only fired from
-         *  createSession's own connect-failure path and destroy() is not itself announced back, so
-         *  a mid-session drop (peer closes, network dies) is currently only observable via isAlive()
-         *  going stale, not a callback. Revisit once/if a sync connection-state getter is added. */
+         *  test panel already validated on-device. The core has no push-based "peer disconnected"
+         *  signal for a headless session (see session_start_headless's doc), so this loop also
+         *  polls its connection state and reports a mid-session drop — see connectionLost. */
         private fun pumpVideo() {
             try {
                 while (running) {
+                    // First, and before the no-Surface branch: a drop must be noticed while the
+                    // session sits in the background too.
+                    if (connectionLost()) return
                     // No Surface attached — nothing to draw onto (blitToSurface no-ops on this
                     // anyway), so skip getFrame()/cursor-poll entirely rather than spinning at the
                     // normal ~60Hz cadence for nothing. updateSurface() already re-blits currentBitmap
@@ -793,8 +804,33 @@ class RustDeskSessionService : Service() {
         private fun allocateBitmap(w: Int, h: Int): Bitmap {
             val fresh = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             currentBitmap = fresh
+            announcedConnected = true
             runCatching { callback?.onConnected(w, h) }
             return fresh
+        }
+
+        /** True — after telling the app once, via onDisconnected([CONNECTION_LOST]) — when the
+         *  core's connection has ended mid-session. Reported: after a Wi-Fi <-> mobile switch (or
+         *  anything else that kills the socket) the picture just froze and the app never noticed;
+         *  only disconnecting and reconnecting by hand helped. The core does see the drop (socket
+         *  error, peer reset, its own 30s receive timeout) and ends its io_loop, but it says so
+         *  through a msgbox, which a headless session never gets — so it is polled here, about
+         *  once a second (cheap: a session lookup and a mutex read).
+         *
+         *  Only once the picture was announced (onConnected): a drop before that stays with the
+         *  app's own connect timeout, whose message points at the usual cause there, a wrong or
+         *  missing password. running = false also stops the clipboard and audio pumps; the native
+         *  session itself is closed by the app's destroy(), as for any other disconnect. */
+        private fun connectionLost(): Boolean {
+            if (!announcedConnected) return false
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastConnStateCheckMs < CONN_STATE_CHECK_INTERVAL_MS) return false
+            lastConnStateCheckMs = now
+            if (NativeBridge.connectionState(sessionId) != NativeBridge.CONN_STATE_DISCONNECTED) return false
+            AppLog.w(TAG, "Session $sessionId: connection lost (core io_loop ended) — telling the app")
+            running = false
+            runCatching { callback?.onDisconnected(CONNECTION_LOST) }
+            return true
         }
 
         /** A decoded frame whose byte count doesn't match the bitmap we allocated (see the call
