@@ -126,6 +126,10 @@ object NativeBridge {
     /** Number of displays (monitors) the peer reported, or 0 if not known yet. */
     external fun getDisplayCount(sessionId: String): Int
 
+    /** The display (0-based) the host offers first — its PRIMARY display, which is not necessarily
+     *  index 0 — or -1 while not known yet (poll again, same as [getDisplayCount]). */
+    external fun getCurrentDisplay(sessionId: String): Int
+
     /** Latest known connection stats (speed/fps/delay/target_bitrate/codec_format) as a JSON
      *  string — see IRustDeskSession.getQualityStatus's doc for the exact shape. */
     external fun pollQualityStatus(sessionId: String): String?

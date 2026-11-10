@@ -938,6 +938,27 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_getDisplay
     })
 }
 
+/// Multi-monitor (lobishell-android): the display the host offers first — its primary, which is not
+/// necessarily index 0 — or -1 while not known yet. See
+/// `librustdesk::flutter::session_get_current_display`.
+#[no_mangle]
+pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_getCurrentDisplay<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    session_id: JString<'local>,
+) -> jint {
+    guard(-1, move || {
+        let session_id: String = env
+            .get_string(&session_id)
+            .map(|s| s.into())
+            .unwrap_or_default();
+        let Ok(session_id) = Uuid::parse_str(&session_id) else {
+            return -1;
+        };
+        librustdesk::flutter::session_get_current_display(session_id)
+    })
+}
+
 /// Multi-monitor (lobishell-android): switches which single display this session captures/views.
 /// `is_desktop = false` in the underlying call (matches RustDesk's own mobile/viewer-style client,
 /// not its multi-window desktop client) — appropriate here since we only ever render one display

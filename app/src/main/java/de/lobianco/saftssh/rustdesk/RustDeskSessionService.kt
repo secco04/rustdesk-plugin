@@ -375,6 +375,15 @@ class RustDeskSessionService : Service() {
         // until the first real position arrives).
         @Volatile private var pointerFbX = -1
         @Volatile private var pointerFbY = -1
+        // Origin of the display being shown within the peer's combined virtual desktop (see
+        // NativeBridge.getDisplayOrigin), re-read in allocateBitmap — the same moment the app
+        // re-reads it, right before onConnected. sendMouse gets VIRTUAL-desktop coordinates (the
+        // app adds this origin so clicks land on the right monitor), but the pointer is drawn into
+        // this one display's picture, so it subtracts the origin again. Without that, every display
+        // not at (0,0) — anything but the primary on Windows — drew its pointer outside the picture:
+        // reported as "no mouse pointer on non-primary displays".
+        @Volatile private var displayOriginX = 0
+        @Volatile private var displayOriginY = 0
 
         // ── Cursor rendering options (see IRustDeskSession.setCursorOptions) ──
         // "host" (default) draws the peer's REAL cursor bitmap once one arrives — the only way to
@@ -464,6 +473,9 @@ class RustDeskSessionService : Service() {
         // the new display can have a different resolution, and RustDeskViewModel needs the new
         // width/height for its own touch inverse-map.
         @Volatile private var currentDisplay = 0
+        // True once currentDisplay points at the display the host offers first (its primary), or
+        // the app switched displays itself — see chooseInitialDisplay.
+        @Volatile private var initialDisplayChosen = false
         // See pumpVideo's initial-display-kick comment — true once the one-shot explicit
         // switchDisplay JNI call has fired for whatever display currentDisplay was pointing at when
         // its size FIRST became known (i.e. the automatic default display of a fresh connect, before
@@ -670,6 +682,7 @@ class RustDeskSessionService : Service() {
                         Thread.sleep(BACKGROUND_NO_SURFACE_SLEEP_MS)
                         continue
                     }
+                    if (!initialDisplayChosen) chooseInitialDisplay()
                     // Captured once per iteration (not re-read below) so a switchDisplay() call
                     // mid-iteration can't mismatch the size this bitmap was allocated for against
                     // the display getFrame reads from.
@@ -700,11 +713,14 @@ class RustDeskSessionService : Service() {
                         // switch_display kick, it starts working. Fire that same kick here, once,
                         // right when we first learn the display's size — the earliest point size is
                         // known to be valid, and before the very first getFrame() poll below.
+                        // (currentDisplay now starts on that same PeerInfo.current_display — see
+                        // chooseInitialDisplay — so this kick mostly re-confirms what the peer
+                        // already streams; kept for the case where the two still differ.)
                         if (!initialDisplayKicked) {
                             initialDisplayKicked = true
                             NativeBridge.switchDisplay(sessionId, display)
                         }
-                        allocateBitmap(size[0], size[1])
+                        allocateBitmap(display, size[0], size[1])
                     } ?: continue
                     // Cursor shape changes arrive independently of video frames (moving the mouse
                     // over a text field changes the cursor without necessarily redrawing anything),
@@ -801,12 +817,33 @@ class RustDeskSessionService : Service() {
          *  RustDeskSessionHolder.onSessionConnected just refreshes remoteWidth/remoteHeight (which
          *  RustDeskScreen's touch inverse-mapping depends on), so a host that changes resolution
          *  mid-session keeps landing taps in the right place instead of being silently off. */
-        private fun allocateBitmap(w: Int, h: Int): Bitmap {
+        private fun allocateBitmap(display: Int, w: Int, h: Int): Bitmap {
             val fresh = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            NativeBridge.getDisplayOrigin(sessionId, display).let {
+                displayOriginX = it.getOrElse(0) { 0 }
+                displayOriginY = it.getOrElse(1) { 0 }
+            }
             currentBitmap = fresh
             announcedConnected = true
             runCatching { callback?.onConnected(w, h) }
             return fresh
+        }
+
+        /** Points [currentDisplay] at the display the host offers first — its primary — once the
+         *  peer has reported its displays. Reported: with several monitors the session always opened
+         *  on the first one (index 0) instead of the primary, because currentDisplay simply started
+         *  at 0 and nothing ever asked the host. Decided once per session, and never over a display
+         *  the app already switched to (switchDisplay sets [initialDisplayChosen] too). */
+        private fun chooseInitialDisplay() {
+            val peer = NativeBridge.getCurrentDisplay(sessionId)
+            if (peer < 0) return   // displays not reported yet - ask again next round
+            if (initialDisplayChosen) return
+            initialDisplayChosen = true
+            if (peer != currentDisplay) {
+                AppLog.i(TAG, "Session $sessionId: starting on the host's primary display $peer " +
+                    "(of ${NativeBridge.getDisplayCount(sessionId)}) instead of $currentDisplay")
+                currentDisplay = peer
+            }
         }
 
         /** True — after telling the app once, via onDisconnected([CONNECTION_LOST]) — when the
@@ -849,7 +886,7 @@ class RustDeskSessionService : Service() {
                     "pumpVideo($sessionId): remote display $display resized " +
                         "${bmp.width}x${bmp.height} -> ${newW}x$newH (frame was $frameSize bytes) — reallocating"
                 )
-                allocateBitmap(newW, newH)
+                allocateBitmap(display, newW, newH)
                 return
             }
             // The announced size still equals the bitmap, so the peer is telling us one resolution
@@ -1234,8 +1271,10 @@ class RustDeskSessionService : Service() {
             // position — don't let it teleport the synthetic cursor to (0, ±1).
             noteActivity()
             if (mouseType != "wheel") {
-                pointerFbX = x
-                pointerFbY = y
+                // x/y are virtual-desktop coordinates; the pointer is drawn into this display's own
+                // picture - see displayOriginX.
+                pointerFbX = x - displayOriginX
+                pointerFbY = y - displayOriginY
             }
             // The host first, then the local redraw happens on the video thread — see
             // redrawRequested's doc for why this must not blit here.
@@ -1293,13 +1332,18 @@ class RustDeskSessionService : Service() {
         override fun getQualityStatus(): String? {
             if (!isCallerAuthorized()) return null
             val quality = NativeBridge.pollQualityStatus(sessionId) ?: return null
-            // The connection's security (`secure`/`direct`) rides along in the same JSON, so the
-            // app learns it without a new AIDL method — an older app simply ignores the keys.
-            val security = NativeBridge.pollConnectionSecurity(sessionId) ?: return quality
+            // The connection's security (`secure`/`direct`) and the display being shown
+            // (`display`, 0-based — the app's display picker needs it since the session now starts
+            // on the host's primary, see chooseInitialDisplay) ride along in the same JSON, so the
+            // app learns them without a new AIDL method — an older app simply ignores the keys.
+            val security = NativeBridge.pollConnectionSecurity(sessionId)
             return runCatching {
                 val merged = JSONObject(quality)
-                val sec = JSONObject(security)
-                sec.keys().forEach { merged.put(it, sec.get(it)) }
+                security?.let { json ->
+                    val sec = JSONObject(json)
+                    sec.keys().forEach { merged.put(it, sec.get(it)) }
+                }
+                if (initialDisplayChosen) merged.put("display", currentDisplay)
                 merged.toString()
             }.getOrDefault(quality)
         }
@@ -1320,6 +1364,7 @@ class RustDeskSessionService : Service() {
         override fun switchDisplay(display: Int) {
             if (!isCallerAuthorized()) return
             currentDisplay = display
+            initialDisplayChosen = true
             // Force pumpVideo's "size unknown yet" branch to run again for the new display, which
             // reallocates the bitmap via allocateBitmap and so fires onConnected a second time with
             // the new size — RustDeskViewModel needs the fresh width/height for its own touch
