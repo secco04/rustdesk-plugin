@@ -146,6 +146,7 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connect<'l
                 password,
                 false, // is_shared_password
                 None,  // conn_token
+                String::new(), // login_method: "" = Automatic (RustDesk 1.5.3; "request-approval" is the other option)
             );
             if !add_result.0.is_empty() {
                 format!("ERR:{}", add_result.0)
@@ -1055,6 +1056,7 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connectFil
                 password,
                 false, // is_shared_password
                 None,  // conn_token
+                String::new(), // login_method: "" = Automatic (RustDesk 1.5.3; "request-approval" is the other option)
             );
             if !add_result.0.is_empty() {
                 format!("ERR:{}", add_result.0)
@@ -1475,6 +1477,7 @@ pub extern "system" fn Java_de_lobianco_saftssh_rustdesk_NativeBridge_connectVie
                 password,
                 false, // is_shared_password
                 None,  // conn_token
+                String::new(), // login_method: "" = Automatic (RustDesk 1.5.3; "request-approval" is the other option)
             );
             if !add_result.0.is_empty() {
                 format!("ERR:{}", add_result.0)
